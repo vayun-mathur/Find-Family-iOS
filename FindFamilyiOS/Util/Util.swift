@@ -95,6 +95,10 @@ enum Strings {
 
     static let okButton = "OK"
     static let cancelButton = "Cancel"
+
+    // PQC broken-lock info box (shown when tapping red lock for non-PQC peers)
+    static let pqcUnprotectedTitle = "Quantum protection"
+    static let pqcUnprotectedMessage = "Unprotected against quantum computers: this person needs to update their app."
 }
 
 // MARK: - Time formatting

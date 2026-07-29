@@ -60,9 +60,24 @@ struct UserDetailPanel: View {
     let onChangeContact: (String, String?) -> Void
     let onToggleSending: (Bool) -> Void
 
+    @State private var showPqcInfo = false
+
     var body: some View {
         VStack(spacing: 12) {
             UserCard(user: user, latest: latest, showSupporting: true) {}
+            // PQC status banner for unprotected connections (also tappable via lock in card)
+            if user.id != Networking.shared.userid && user.pqcEncryptionKey == nil {
+                Button { showPqcInfo = true } label: {
+                    Label(Strings.pqcUnprotectedMessage, systemImage: "lock.open.trianglebadge.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(Color.red.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+            }
             HStack {
                 Text(Strings.shareYourLocation)
                 Spacer()
@@ -73,7 +88,6 @@ struct UserDetailPanel: View {
             .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
 
             // Precision Finding entry — pushed onto the MainView's NavigationStack.
-            // User already conforms to Hashable, so it doubles as the destination value.
             NavigationLink(value: user) {
                 Label("Find with Precision", systemImage: "location.north.line.fill")
                     .frame(maxWidth: .infinity)
@@ -88,6 +102,11 @@ struct UserDetailPanel: View {
             .buttonStyle(.bordered)
         }
         .padding(.horizontal)
+        .alert(Strings.pqcUnprotectedTitle, isPresented: $showPqcInfo) {
+            Button(Strings.okButton, role: .cancel) {}
+        } message: {
+            Text(Strings.pqcUnprotectedMessage)
+        }
     }
 }
 
