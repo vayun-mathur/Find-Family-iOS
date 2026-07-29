@@ -125,7 +125,8 @@ struct AddPersonDialog: View {
             sendingEnabled: true,
             requestStatus: newStatus,
             lastLocationChangeTime: Date(),
-            encryptionKey: nil
+            encryptionKey: nil,
+            pqcEncryptionKey: nil
         )
         Database.shared.upsertUser(user)
         isPresented = false
@@ -201,12 +202,24 @@ struct AddLinkDialog: View {
                 let pubPEM = try RSAPEM.publicKeyToPEM(pub)
                 let priB64 = Data(priPEM.utf8).base64EncodedString()
                 let pubB64 = Data(pubPEM.utf8).base64EncodedString()
+                // PQC ephemeral — best effort, RSA still works if native not linked.
+                var pqcPublicB64: String? = nil
+                var pqcPrivateB64: String? = nil
+                do {
+                    let ep = try PQCKeyManager.shared.generateEphemeralBundle()
+                    pqcPublicB64 = ep.publicB64
+                    pqcPrivateB64 = ep.privateB64
+                } catch {
+                    print("AddLink: PQC ephemeral unavailable (native not linked?): \(error.localizedDescription)")
+                }
                 let link = TemporaryLink(
                     id: 0,
                     name: name.trimmingCharacters(in: .whitespaces),
                     key: priB64,
                     publicKey: pubB64,
-                    deleteAt: Date().addingTimeInterval(expirySeconds)
+                    deleteAt: Date().addingTimeInterval(expirySeconds),
+                    pqcPublicKey: pqcPublicB64,
+                    pqcKey: pqcPrivateB64
                 )
                 _ = Database.shared.upsertTemporaryLink(link)
             } catch {

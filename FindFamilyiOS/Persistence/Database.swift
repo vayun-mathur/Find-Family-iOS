@@ -59,6 +59,10 @@ final class Database {
         if !columnExists(table: "users", column: "platform") {
             exec("ALTER TABLE users ADD COLUMN platform TEXT;")
         }
+        if !columnExists(table: "users", column: "pqcEncryptionKey") {
+            // PQC bundle cache (base64 of [4B kemLen][kemPubDer][dsaPubDer]) — same format as Office.
+            exec("ALTER TABLE users ADD COLUMN pqcEncryptionKey TEXT;")
+        }
         exec("""
         CREATE TABLE IF NOT EXISTS waypoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -91,6 +95,12 @@ final class Database {
             deleteAt INTEGER NOT NULL
         );
         """)
+        if !columnExists(table: "temporaryLinks", column: "pqcPublicKey") {
+            exec("ALTER TABLE temporaryLinks ADD COLUMN pqcPublicKey TEXT;")
+        }
+        if !columnExists(table: "temporaryLinks", column: "pqcKey") {
+            exec("ALTER TABLE temporaryLinks ADD COLUMN pqcKey TEXT;")
+        }
     }
 
     // MARK: - Reload helpers
@@ -130,8 +140,8 @@ final class Database {
     func upsertUser(_ u: User) {
         queue.sync {
             let sql = """
-            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
@@ -144,6 +154,7 @@ final class Database {
             sqlite3_bind_int64(stmt, 7, Int64(u.lastLocationChangeTime.timeIntervalSince1970))
             bindOptionalText(stmt, 8, u.encryptionKey)
             bindOptionalText(stmt, 9, u.platform)
+            bindOptionalText(stmt, 10, u.pqcEncryptionKey)
             sqlite3_step(stmt)
             sqlite3_finalize(stmt)
             usersSubject.send(loadUsers())
@@ -161,9 +172,32 @@ final class Database {
 
     private func loadUsers() -> [User] {
         var out: [User] = []
-        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform FROM users;"
+        // pqcEncryptionKey column added via idempotent migration; SELECT explicitly to handle older dbs.
+        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey FROM users;"
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        if rc != SQLITE_OK {
+            // Fallback: older schema without pqcEncryptionKey (should be migrated, but be safe during dev).
+            sqlite3_finalize(stmt)
+            let sql2 = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform FROM users;"
+            sqlite3_prepare_v2(db, sql2, -1, &stmt, nil)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append(User(
+                    id: sqlite3_column_int64(stmt, 0),
+                    name: text(stmt, 1) ?? "",
+                    photo: text(stmt, 2),
+                    locationName: text(stmt, 3) ?? "",
+                    sendingEnabled: sqlite3_column_int(stmt, 4) != 0,
+                    requestStatus: RequestStatus(rawValue: text(stmt, 5) ?? "MUTUAL_CONNECTION") ?? .mutualConnection,
+                    lastLocationChangeTime: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6))),
+                    encryptionKey: text(stmt, 7),
+                    platform: text(stmt, 8),
+                    pqcEncryptionKey: nil
+                ))
+            }
+            sqlite3_finalize(stmt)
+            return out
+        }
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append(User(
                 id: sqlite3_column_int64(stmt, 0),
@@ -174,7 +208,8 @@ final class Database {
                 requestStatus: RequestStatus(rawValue: text(stmt, 5) ?? "MUTUAL_CONNECTION") ?? .mutualConnection,
                 lastLocationChangeTime: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6))),
                 encryptionKey: text(stmt, 7),
-                platform: text(stmt, 8)
+                platform: text(stmt, 8),
+                pqcEncryptionKey: text(stmt, 9)
             ))
         }
         sqlite3_finalize(stmt)
@@ -299,18 +334,20 @@ final class Database {
         var result = link
         queue.sync {
             if link.id == 0 {
-                let sql = "INSERT INTO temporaryLinks (name, key, publicKey, deleteAt) VALUES (?, ?, ?, ?);"
+                let sql = "INSERT INTO temporaryLinks (name, key, publicKey, deleteAt, pqcPublicKey, pqcKey) VALUES (?, ?, ?, ?, ?, ?);"
                 var stmt: OpaquePointer?
                 sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
                 bindText(stmt, 1, link.name)
                 bindText(stmt, 2, link.key)
                 bindText(stmt, 3, link.publicKey)
                 sqlite3_bind_int64(stmt, 4, Int64(link.deleteAt.timeIntervalSince1970))
+                bindOptionalText(stmt, 5, link.pqcPublicKey)
+                bindOptionalText(stmt, 6, link.pqcKey)
                 sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
                 result.id = sqlite3_last_insert_rowid(db)
             } else {
-                let sql = "INSERT OR REPLACE INTO temporaryLinks (id, name, key, publicKey, deleteAt) VALUES (?, ?, ?, ?, ?);"
+                let sql = "INSERT OR REPLACE INTO temporaryLinks (id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey) VALUES (?, ?, ?, ?, ?, ?, ?);"
                 var stmt: OpaquePointer?
                 sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
                 sqlite3_bind_int64(stmt, 1, link.id)
@@ -318,6 +355,8 @@ final class Database {
                 bindText(stmt, 3, link.key)
                 bindText(stmt, 4, link.publicKey)
                 sqlite3_bind_int64(stmt, 5, Int64(link.deleteAt.timeIntervalSince1970))
+                bindOptionalText(stmt, 6, link.pqcPublicKey)
+                bindOptionalText(stmt, 7, link.pqcKey)
                 sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
@@ -335,16 +374,37 @@ final class Database {
 
     private func loadTemporaryLinks() -> [TemporaryLink] {
         var out: [TemporaryLink] = []
-        let sql = "SELECT id, name, key, publicKey, deleteAt FROM temporaryLinks;"
+        // Try new schema first; fallback to old if column missing.
+        let sql = "SELECT id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey FROM temporaryLinks;"
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        if rc != SQLITE_OK {
+            sqlite3_finalize(stmt)
+            let sql2 = "SELECT id, name, key, publicKey, deleteAt FROM temporaryLinks;"
+            sqlite3_prepare_v2(db, sql2, -1, &stmt, nil)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out.append(TemporaryLink(
+                    id: sqlite3_column_int64(stmt, 0),
+                    name: text(stmt, 1) ?? "",
+                    key: text(stmt, 2) ?? "",
+                    publicKey: text(stmt, 3) ?? "",
+                    deleteAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 4))),
+                    pqcPublicKey: nil,
+                    pqcKey: nil
+                ))
+            }
+            sqlite3_finalize(stmt)
+            return out
+        }
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append(TemporaryLink(
                 id: sqlite3_column_int64(stmt, 0),
                 name: text(stmt, 1) ?? "",
                 key: text(stmt, 2) ?? "",
                 publicKey: text(stmt, 3) ?? "",
-                deleteAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 4)))
+                deleteAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 4))),
+                pqcPublicKey: text(stmt, 5),
+                pqcKey: text(stmt, 6)
             ))
         }
         sqlite3_finalize(stmt)

@@ -151,10 +151,20 @@ struct TemporaryLinkCard: View {
                 Text(Strings.expires(TimeFormatting.timestring(link.deleteAt, future: true)))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                if link.pqcPublicKey != nil {
+                    Text("PQC enabled").font(.caption2).foregroundStyle(.green)
+                }
             }
             Spacer()
             Button {
-                let url = "https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#key=\(link.key)"
+                // PQC routing: include PQC private bundle fragment when available.
+                // Fragment never hits server; classic #key= still present for backward compat.
+                let base = "https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#key=\(link.key)"
+                let url = if let pqcPriv = link.pqcKey {
+                    "\(base)&pqc_key=\(pqcPriv)"
+                } else {
+                    base
+                }
                 Platform.copy(url)
             } label: { Image(systemName: "doc.on.doc") }
             Button(role: .destructive) {

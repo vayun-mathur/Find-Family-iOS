@@ -58,11 +58,14 @@ struct User: Identifiable, Codable, Hashable, Equatable {
     /// Peer device platform (`"android"` or `"ios"`), learned from incoming heartbeats.
     /// Used by the UWB ranging path to pick same-platform vs cross-platform protocol.
     var platform: String? = nil
+    /// Post-quantum public bundle (base64 of [4B kemLen][kemPubDer][dsaPubDer]), nullable for migration.
+    /// Same format as Android Office `Pqc.bundle` / `ff_pqc` key directory.
+    var pqcEncryptionKey: String? = nil
 
     static let empty = User(
         id: 0, name: "", photo: nil, locationName: "Unnamed Location",
         sendingEnabled: false, requestStatus: .mutualConnection,
-        lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil
+        lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil, pqcEncryptionKey: nil
     )
 }
 
@@ -150,4 +153,8 @@ struct TemporaryLink: Identifiable, Codable, Hashable, Equatable {
     /// Base64(PEM) RSA public key — registered for the link's id and used by senders.
     var publicKey: String
     var deleteAt: Date
+    /// PQC ephemeral public bundle (base64 [4B kemLen][kemPub][dsaPub]), nullable for migration.
+    var pqcPublicKey: String? = nil
+    /// PQC ephemeral private bundle (base64 [4B kemPrivLen][kemPriv][dsaPriv]), nullable. Fragment `#pqc_key=` contains this.
+    var pqcKey: String? = nil
 }

@@ -32,17 +32,31 @@ final class NetworkClient {
 
 // MARK: - Networking singleton
 
-/// Mirrors `Networking.kt` from Modern-Apps. Owns identity (userid, RSA key pair),
+/// Mirrors `Networking.kt` from Modern-Apps. Owns identity (userid, RSA + PQC key pairs),
 /// registration with the server, and the encrypted publish/receive flows.
+///
+/// PQC support mirrors Office's Android `PqcIdentity.loadOrCreate` system:
+///   - Device PQC identity uses `PQCKeyManager` which stores `ff_pqcKemPub/Priv`, `ff_pqcDsaPub/Priv`
+///     (same as Android's `ff_pqc` prefix) in Keychain, with bundle format [4B kemLen][kemPub][dsaPub]
+///     and sealed layout [4B encapLen][encap][aes] (aes = [12B iv][ct||tag]), KDF SHA256(BE32(1)||Z).
+///   - Server parallel endpoints `/api/pqc/*` store PQC bundles separately from RSA; publish/receive
+///     have `_pqc` variants. If peer has PQC key, publish ONLY to PQC endpoint (higher tier).
+///   - Receive drains both classic and PQC queues for backward compat during rollout.
 @MainActor
 final class Networking: ObservableObject {
     static let shared = Networking()
 
     private let client = NetworkClient()
     private(set) var userid: Int64 = 0
+    // RSA
     private var publicKey: SecKey?
     private var privateKey: SecKey?
     private var publicKeyPEMBase64: String = ""
+    // PQC — mirrors Office/FF Android ff_pqc prefix
+    private var pqcPublicBundleB64: String = ""
+    private var pqcIdentity: PQCIdentity?
+    var pqcAvailable: Bool { pqcIdentity != nil }
+
     private var networkIsDown = false
 
     /// Local platform tag included in outgoing heartbeat payloads so peers learn we're on iOS.
@@ -61,11 +75,26 @@ final class Networking: ObservableObject {
                 userid = Int64.random(in: Int64.min...Int64.max)
                 Keychain.setInt64(userid, key: "userid")
             }
+            // RSA
             let (pri, pub) = try RSAKeyManager.shared.keyPair()
             privateKey = pri
             publicKey = pub
             let pem = try RSAPEM.publicKeyToPEM(pub)
             publicKeyPEMBase64 = Data(pem.utf8).base64EncodedString()
+
+            // PQC — best effort. If Rust XCFramework not linked, this throws and we stay RSA-only.
+            // This mirrors Android's try/catch around PqcIdentity so legacy builds keep working.
+            do {
+                let id = try PQCKeyManager.shared.identity()
+                pqcIdentity = id
+                pqcPublicBundleB64 = id.publicBundle.base64EncodedString()
+                print("Networking: PQC identity ready bundleLen=\(id.publicBundle.count)")
+            } catch {
+                print("Networking: PQC unavailable (native not linked?): \(error.localizedDescription)")
+                pqcIdentity = nil
+                pqcPublicBundleB64 = ""
+            }
+
             isReady = true
             ensureMeUserExists()
             _ = await ensureUserExists()
@@ -87,7 +116,8 @@ final class Networking: ObservableObject {
                 sendingEnabled: false,
                 requestStatus: .mutualConnection,
                 lastLocationChangeTime: Date(),
-                encryptionKey: nil
+                encryptionKey: nil,
+                pqcEncryptionKey: nil
             )
             Database.shared.upsertUser(me)
         }
@@ -104,11 +134,29 @@ final class Networking: ObservableObject {
         return await postBool("/api/register", body: body)
     }
 
+    func registerPqc() async -> Bool {
+        guard !pqcPublicBundleB64.isEmpty else { return false }
+        let body = encodeJSON([
+            "userid": .uint64(UInt64(bitPattern: userid)),
+            "key": .string(pqcPublicBundleB64),
+        ])
+        let ok = await postBool("/api/pqc/register", body: body)
+        print("Networking: registerPqc userid=\(UInt64(bitPattern: userid)) ok=\(ok) bundleLen=\(pqcIdentity?.publicBundle.count ?? -1)")
+        return ok
+    }
+
     func ensureUserExists() async -> Bool {
+        var ok = true
         if await getKey(forUserid: userid) == nil {
-            return await register()
+            ok = await register() && ok
         }
-        return true
+        // PQC self-healing: ensure PQC key registered too if available.
+        if pqcAvailable {
+            if await getPqcKeyRaw(forUserid: userid) == nil {
+                ok = await registerPqc() && ok
+            }
+        }
+        return ok
     }
 
     /// GET-style lookup: server returns the raw base64-PEM string in the response body.
@@ -133,7 +181,72 @@ final class Networking: ObservableObject {
         }
     }
 
+    // MARK: - PQC key fetch (raw bundle)
+
+    /// Raw PQC bundle Data fetch (base64 decoded), for registration self-heal check.
+    func getPqcKeyRaw(forUserid id: Int64) async -> Data? {
+        guard pqcAvailable else { return nil }
+        let body = Data(#"{"userid": \#(UInt64(bitPattern: id))}"#.utf8)
+        do {
+            let (data, http) = try await client.postJSON(path: "/api/pqc/getkey", jsonBody: body)
+            networkIsDown = false
+            guard http.statusCode == 200 else { return nil }
+            guard let b64 = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"")),
+                  let bundleData = Data(base64Encoded: b64),
+                  !bundleData.isEmpty
+                else { return nil }
+            return bundleData
+        } catch {
+            checkNetworkDown(error)
+            return nil
+        }
+    }
+
+    /// Fetches peer PQC bundle, caches to DB, returns Data.
+    func getPqcBundle(forUserid id: Int64) async -> Data? {
+        guard pqcAvailable else { return nil }
+        if let data = await getPqcKeyRaw(forUserid: id) {
+            // cache
+            if var u = Database.shared.user(id: id), u.pqcEncryptionKey == nil {
+                u.pqcEncryptionKey = data.base64EncodedString()
+                Database.shared.upsertUser(u)
+            } else if Database.shared.user(id: id) == nil {
+                // We have a bundle but no user yet — user will be created by location receive path.
+            }
+            return data
+        }
+        return nil
+    }
+
+    // MARK: - Publish Location (PQC routing: if peer has PQC key, ONLY use PQC endpoint)
+
     func publishLocation(_ location: LocationValue, toUser user: User) async -> Bool {
+        // PQC fast-path: if peer has bundle (cached or just fetched), publish only to PQC endpoint.
+        if let bundle = await resolvedPqcBundle(for: user) {
+            if let ok = await publishEncryptedPqc(location: location, recipientID: user.id, bundle: bundle) {
+                return ok
+            }
+            // if PQC encrypt fails, fallback to RSA
+            print("Networking: publishLocation PQC failed for \(UInt64(bitPattern: user.id)), falling back to RSA")
+        }
+        return await publishLocationClassic(location, toUser: user)
+    }
+
+    private func resolvedPqcBundle(for user: User) async -> Data? {
+        guard pqcAvailable else { return nil }
+        if let b64 = user.pqcEncryptionKey, let data = Data(base64Encoded: b64), !data.isEmpty {
+            return data
+        }
+        // Opportunistic fetch from server.
+        if let data = await getPqcBundle(forUserid: user.id) {
+            return data
+        }
+        return nil
+    }
+
+    private func publishLocationClassic(_ location: LocationValue, toUser user: User) async -> Bool {
         let key: SecKey?
         if let encKeyB64 = user.encryptionKey,
            let pemData = Data(base64Encoded: encKeyB64),
@@ -141,7 +254,6 @@ final class Networking: ObservableObject {
            let k = RSAPEM.publicKeyFromPEM(pem) {
             key = k
         } else if let k = await getKey(forUserid: user.id) {
-            // Cache for next time.
             do {
                 let pem = try RSAPEM.publicKeyToPEM(k)
                 let b64 = Data(pem.utf8).base64EncodedString()
@@ -158,6 +270,17 @@ final class Networking: ObservableObject {
     }
 
     func publishLocation(_ location: LocationValue, toLink link: TemporaryLink) async -> Bool {
+        // TemporaryLink PQC routing: if link has PQC bundle, publish only to PQC endpoint.
+        if pqcAvailable, let b64 = link.pqcPublicKey, let bundle = Data(base64Encoded: b64), !bundle.isEmpty {
+            if let ok = await publishEncryptedPqc(location: location, recipientID: link.id, bundle: bundle) {
+                return ok
+            }
+            // fallback to RSA
+        }
+        return await publishLocationClassic(location, toLink: link)
+    }
+
+    private func publishLocationClassic(_ location: LocationValue, toLink link: TemporaryLink) async -> Bool {
         guard let pemData = Data(base64Encoded: link.publicKey),
               let pem = String(data: pemData, encoding: .utf8),
               let key = RSAPEM.publicKeyFromPEM(pem)
@@ -180,25 +303,53 @@ final class Networking: ObservableObject {
         }
     }
 
+    private func publishEncryptedPqc(location: LocationValue, recipientID: Int64, bundle: Data) async -> Bool? {
+        guard pqcAvailable else { return nil }
+        do {
+            let json = try JSONEncoder().encode(location.toCompatible(senderPlatform: Self.platformTag))
+            // Encrypt via PQC (ML-KEM encaps + AES-GCM), same as Kotlin Pqc.encryptTo
+            let sealed = try PQCKeyManager.shared.encryptTo(bundle: bundle, plaintext: json)
+            let body = encodeJSON([
+                "recipientUserID": .uint64(UInt64(bitPattern: recipientID)),
+                "encryptedLocation": .string(sealed.base64EncodedString()),
+            ])
+            let ok = await postBool("/api/location/publish_pqc", body: body)
+            print("publishEncryptedPqc to \(UInt64(bitPattern: recipientID)) ok=\(ok) encLen=\(sealed.count)")
+            return ok
+        } catch {
+            print("publishEncryptedPqc error: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // MARK: - Receive (drains both classic + PQC for backward compat)
+
     func receiveLocations() async -> [LocationValue]? {
+        // Always try classic first; then PQC if available. Merge for fleet transition.
+        let classic = await receiveLocationsClassic()
+        let pqc = await receiveLocationsPqc()
+        if classic == nil && pqc == nil { return nil }
+        let merged = (classic ?? []) + (pqc ?? [])
+        print("receiveLocations merged total=\(merged.count) classic=\(classic?.count ?? -1) pqc=\(pqc?.count ?? -1)")
+        return merged
+    }
+
+    private func receiveLocationsClassic() async -> [LocationValue]? {
         guard let priv = privateKey else { return nil }
         let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
         do {
             let (data, http) = try await client.postJSON(path: "/api/location/receive", jsonBody: body)
             networkIsDown = false
-            // 204 means "no incoming locations for this user" — treat as success-empty.
-            if http.statusCode == 204 || data.isEmpty {
-                return []
-            }
+            if http.statusCode == 204 || data.isEmpty { return [] }
             guard http.statusCode == 200 else {
-                print("receiveLocations: HTTP \(http.statusCode)")
+                print("receiveLocationsClassic: HTTP \(http.statusCode)")
                 return nil
             }
             let arr = try JSONDecoder().decode([String].self, from: data)
             var out: [LocationValue] = []
             for b64 in arr {
                 guard let bytes = Data(base64Encoded: b64) else {
-                    print("receiveLocations: skipped non-base64 entry")
+                    print("receiveLocationsClassic: skipped non-base64 entry")
                     continue
                 }
                 do {
@@ -206,7 +357,6 @@ final class Networking: ObservableObject {
                     let comp = try JSONDecoder().decode(LocationValueCompatible.self, from: plain)
                     let loc = comp.toLocationValue()
                     out.append(loc)
-                    // Opportunistically capture peer platform tag from the encrypted payload.
                     if let platform = comp.senderPlatform,
                        var u = Database.shared.user(id: loc.userid),
                        u.platform != platform {
@@ -214,10 +364,51 @@ final class Networking: ObservableObject {
                         Database.shared.upsertUser(u)
                     }
                 } catch {
-                    print("receiveLocations: decrypt/parse failure: \(error.localizedDescription)")
+                    print("receiveLocationsClassic: decrypt/parse failure: \(error.localizedDescription)")
                 }
             }
-            print("receiveLocations: \(out.count) location(s) for userid=\(UInt64(bitPattern: userid))")
+            print("receiveLocationsClassic: \(out.count) location(s) for userid=\(UInt64(bitPattern: userid))")
+            return out
+        } catch {
+            checkNetworkDown(error)
+            return nil
+        }
+    }
+
+    private func receiveLocationsPqc() async -> [LocationValue]? {
+        guard pqcAvailable, (try? PQCKeyManager.shared.identity()) != nil else { return [] }
+        let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
+        do {
+            let (data, http) = try await client.postJSON(path: "/api/location/receive_pqc", jsonBody: body)
+            networkIsDown = false
+            if http.statusCode == 204 || data.isEmpty { return [] }
+            guard http.statusCode == 200 else {
+                print("receiveLocationsPqc: HTTP \(http.statusCode)")
+                return nil
+            }
+            let arr = try JSONDecoder().decode([String].self, from: data)
+            var out: [LocationValue] = []
+            for b64 in arr {
+                guard let sealed = Data(base64Encoded: b64) else {
+                    print("receiveLocationsPqc: skipped non-base64")
+                    continue
+                }
+                do {
+                    let plain = try PQCKeyManager.shared.decrypt(sealed: sealed)
+                    let comp = try JSONDecoder().decode(LocationValueCompatible.self, from: plain)
+                    let loc = comp.toLocationValue()
+                    out.append(loc)
+                    if let platform = comp.senderPlatform,
+                       var u = Database.shared.user(id: loc.userid),
+                       u.platform != platform {
+                        u.platform = platform
+                        Database.shared.upsertUser(u)
+                    }
+                } catch {
+                    print("receiveLocationsPqc: decrypt/parse failure: \(error.localizedDescription)")
+                }
+            }
+            print("receiveLocationsPqc: \(out.count) location(s) for userid=\(UInt64(bitPattern: userid))")
             return out
         } catch {
             checkNetworkDown(error)
@@ -252,17 +443,32 @@ final class Networking: ObservableObject {
         _ = await postBool("/api/problem", body: body)
     }
 
-    // MARK: - UWB session-setup channel
-    //
-    // Mirrors the location publish/receive flow but carries the small UWB
-    // handshake envelopes (request / ack / config / cancel) end-to-end
-    // encrypted. Each payload is at most a few hundred bytes; ranging samples
-    // themselves never touch the server.
+    // MARK: - UWB session-setup channel (with PQC routing)
 
-    /// Publishes [envelope] to [recipientID]. Resolves the recipient's public
-    /// key from the cached `User.encryptionKey` first, then falls back to a
-    /// `/api/getkey` lookup. Encrypts with RSA-OAEP/SHA-512.
+    /// Publishes [envelope] to [recipientID]. If peer has PQC bundle, publishes ONLY to PQC endpoint.
     func publishUwbMessage(_ envelope: UwbEnvelope, to recipientID: Int64) async -> Bool {
+        // PQC fast-path
+        if pqcAvailable {
+            var pqcBundle: Data? = nil
+            if let user = Database.shared.user(id: recipientID),
+               let b64 = user.pqcEncryptionKey,
+               let data = Data(base64Encoded: b64), !data.isEmpty {
+                pqcBundle = data
+            } else if let data = await getPqcBundle(forUserid: recipientID) {
+                pqcBundle = data
+            }
+            if let bundle = pqcBundle {
+                if let ok = await publishUwbMessagePqc(envelope, to: recipientID, bundle: bundle) {
+                    return ok
+                }
+                print("publishUwbMessage PQC failed for \(UInt64(bitPattern: recipientID)), fallback RSA")
+            }
+        }
+        // Classic fallback
+        return await publishUwbMessageClassic(envelope, to: recipientID)
+    }
+
+    private func publishUwbMessageClassic(_ envelope: UwbEnvelope, to recipientID: Int64) async -> Bool {
         let key: SecKey?
         if let user = Database.shared.user(id: recipientID),
            let encKeyB64 = user.encryptionKey,
@@ -285,14 +491,38 @@ final class Networking: ObservableObject {
             ])
             return await postBool("/api/uwb/publish", body: body)
         } catch {
-            print("publishUwbMessage encrypt error: \(error)")
+            print("publishUwbMessageClassic encrypt error: \(error)")
             return false
         }
     }
 
-    /// Drains incoming UWB envelopes addressed to this user. The server queue
-    /// is cleared on receive (same semantics as `/api/location/receive`).
+    private func publishUwbMessagePqc(_ envelope: UwbEnvelope, to recipientID: Int64, bundle: Data) async -> Bool? {
+        guard pqcAvailable else { return nil }
+        do {
+            let json = try JSONEncoder().encode(envelope)
+            let sealed = try PQCKeyManager.shared.encryptTo(bundle: bundle, plaintext: json)
+            let body = encodeJSON([
+                "recipientUserID": .uint64(UInt64(bitPattern: recipientID)),
+                "encryptedLocation": .string(sealed.base64EncodedString()),
+            ])
+            let ok = await postBool("/api/uwb/publish_pqc", body: body)
+            print("publishUwbMessagePqc to \(UInt64(bitPattern: recipientID)) ok=\(ok)")
+            return ok
+        } catch {
+            print("publishUwbMessagePqc encrypt error: \(error)")
+            return nil
+        }
+    }
+
+    /// Drains incoming UWB envelopes from both classic and PQC queues (merged).
     func receiveUwbMessages() async -> [UwbEnvelope]? {
+        let classic = await receiveUwbMessagesClassic()
+        let pqc = await receiveUwbMessagesPqc()
+        if classic == nil && pqc == nil { return nil }
+        return (classic ?? []) + (pqc ?? [])
+    }
+
+    private func receiveUwbMessagesClassic() async -> [UwbEnvelope]? {
         guard let priv = privateKey else { return nil }
         let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
         do {
@@ -305,6 +535,30 @@ final class Networking: ObservableObject {
             for b64 in arr {
                 guard let bytes = Data(base64Encoded: b64) else { continue }
                 if let plain = try? RSAKeyManager.shared.decryptOAEPSHA512(bytes, privateKey: priv),
+                   let env = try? JSONDecoder().decode(UwbEnvelope.self, from: plain) {
+                    out.append(env)
+                }
+            }
+            return out
+        } catch {
+            checkNetworkDown(error)
+            return nil
+        }
+    }
+
+    private func receiveUwbMessagesPqc() async -> [UwbEnvelope]? {
+        guard pqcAvailable, (try? PQCKeyManager.shared.identity()) != nil else { return [] }
+        let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
+        do {
+            let (data, http) = try await client.postJSON(path: "/api/uwb/receive_pqc", jsonBody: body)
+            networkIsDown = false
+            if http.statusCode == 204 || data.isEmpty { return [] }
+            guard http.statusCode == 200 else { return nil }
+            let arr = try JSONDecoder().decode([String].self, from: data)
+            var out: [UwbEnvelope] = []
+            for b64 in arr {
+                guard let sealed = Data(base64Encoded: b64) else { continue }
+                if let plain = try? PQCKeyManager.shared.decrypt(sealed: sealed),
                    let env = try? JSONDecoder().decode(UwbEnvelope.self, from: plain) {
                     out.append(env)
                 }
