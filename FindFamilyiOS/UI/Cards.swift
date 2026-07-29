@@ -74,9 +74,11 @@ struct UserCard: View {
 
     @State private var showPqcInfo = false
 
+    /// True iff this connection is PQC-protected (quantum safe). Self never shows badge.
     var isPqcProtected: Bool {
-        // Self and users without RSA key (awaiting) skip badge. PQC present => protected.
         if user.id == Networking.shared.userid { return true }
+        if user.id == 0 { return true } // empty/new waypoint placeholder
+        // A user with a cached PQC bundle is protected; otherwise show broken lock.
         return user.pqcEncryptionKey != nil
     }
 
@@ -103,70 +105,62 @@ struct UserCard: View {
     }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Button(action: showSupporting ? onTap : {}) {
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(spacing: 4) {
-                        UserPicture(user: user, size: 56)
-                        if let b = latest?.battery {
-                            BatteryBar(percent: b)
-                        }
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 4) {
-                            Text(user.name).font(.headline).lineLimit(1)
-                            if showSupporting && user.id != Networking.shared.userid {
-                                PqcLockIcon(isPqc: isPqcProtected) {
-                                    if !isPqcProtected { showPqcInfo = true }
-                                }
-                            }
-                        }
-                        if showSupporting {
-                            Text(Strings.userCardStatus(lastUpdatedString, user.locationName, sinceString))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    if showSupporting {
-                        Text(speedString).font(.caption2).foregroundStyle(.secondary)
+        // Wrap outer so .alert modifier is not inside the Card's Button gesture.
+        Button(action: showSupporting ? onTap : {}) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(spacing: 4) {
+                    UserPicture(user: user, size: 56)
+                    if let b = latest?.battery {
+                        BatteryBar(percent: b)
                     }
                 }
-                .padding(12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(user.name).font(.headline).lineLimit(1)
+                        // Broken-lock icon: only in list/detail and for non-self connections.
+                        // If protected -> green closed lock (static). If unprotected -> red broken lock tappable.
+                        if showSupporting && user.id != Networking.shared.userid {
+                            if isPqcProtected {
+                                Image(systemName: "lock.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.green)
+                                    .accessibilityLabel("Quantum protected")
+                            } else {
+                                // Button wrapper prevents parent Button from also receiving tap.
+                                Button {
+                                    showPqcInfo = true
+                                } label: {
+                                    Image(systemName: "lock.open.trianglebadge.exclamationmark")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Color.red)
+                                        .padding(6)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Not quantum protected")
+                            }
+                        }
+                    }
+                    if showSupporting {
+                        Text(Strings.userCardStatus(lastUpdatedString, user.locationName, sinceString))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if showSupporting {
+                    Text(speedString).font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            .buttonStyle(.plain)
-            .disabled(!showSupporting)
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
         }
+        .buttonStyle(.plain)
+        .disabled(!showSupporting)
         .alert(Strings.pqcUnprotectedTitle, isPresented: $showPqcInfo) {
             Button(Strings.okButton, role: .cancel) {}
         } message: {
             Text(Strings.pqcUnprotectedMessage)
-        }
-    }
-}
-
-// Broken-lock indicator — tappable only when not PQC.
-private struct PqcLockIcon: View {
-    let isPqc: Bool
-    let onTapUnprotected: () -> Void
-    var body: some View {
-        Group {
-            if isPqc {
-                Image(systemName: "lock.fill")
-                    .font(.caption)
-                    .foregroundStyle(Color.green)
-                    .accessibilityLabel("Quantum protected")
-            } else {
-                Image(systemName: "lock.open.trianglebadge.exclamationmark")
-                    .font(.caption)
-                    .foregroundStyle(Color.red)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        onTapUnprotected()
-                    }
-                    .accessibilityLabel("Not quantum protected")
-            }
         }
     }
 }
