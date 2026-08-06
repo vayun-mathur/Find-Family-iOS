@@ -78,6 +78,7 @@ enum Strings {
     static let addPersonName = "Contact's Name"
     static let addPersonSubmit = "Request Location"
     static let addPersonAccept = "Accept Location Request"
+    static let shareInviteLink = "Share invite link"
     static let addPersonAwaitingRequest = "This person has requested your location"
     static let addPersonSelf = "Cannot share your location with yourself"
     static let addPersonAlreadyMutual = "Already sharing location with this person"
@@ -162,6 +163,30 @@ enum NotificationsUtil {
         content.sound = .default
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
+    }
+}
+
+// MARK: - Deep links
+
+/// Routes incoming `findfamily://add/<base26>` invites to the UI. The link carries
+/// only the sender's public id — never a key — so prefilling the Add Person dialog
+/// from it is safe; the user still explicitly accepts.
+final class DeepLinkRouter: ObservableObject {
+    static let shared = DeepLinkRouter()
+    private init() {}
+
+    /// Decoded invite user id awaiting presentation, or nil once consumed.
+    @Published var pendingAddId: Int64?
+
+    func handle(_ url: URL) {
+        guard url.scheme == "findfamily", url.host == "add" else { return }
+        let segment = (url.pathComponents.last { $0 != "/" } ?? "")
+            .trimmingCharacters(in: .whitespaces)
+            .uppercased()
+        guard !segment.isEmpty,
+              segment.allSatisfy({ $0.isASCII && $0.isLetter }),
+              let id = Base26.decode(segment) else { return }
+        pendingAddId = id
     }
 }
 

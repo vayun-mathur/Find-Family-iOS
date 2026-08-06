@@ -35,6 +35,7 @@ final class MainViewModel: ObservableObject {
 
 struct MainView: View {
     @StateObject private var vm = MainViewModel()
+    @ObservedObject private var deepLink = DeepLinkRouter.shared
 
     // Selection state
     @State private var selectedUserId: Int64?
@@ -135,6 +136,13 @@ struct MainView: View {
                let wp = vm.waypoints.first(where: { $0.id == id }) {
                 animateToCoord = wp.coord
             }
+        }
+        // A tapped findfamily://add/<id> invite prefills the Add Person dialog. @Published
+        // replays its current value on subscribe, so this catches cold-start links too.
+        .onReceive(deepLink.$pendingAddId.compactMap { $0 }) { id in
+            addPersonId = id
+            showAddPersonDialog = true
+            deepLink.pendingAddId = nil
         }
     }
 

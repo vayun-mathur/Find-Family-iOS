@@ -70,6 +70,19 @@ struct AddPersonDialog: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    // Share sheet instead of copy/paste: sends findfamily://add/<myId>,
+                    // which prefills the recipient's Add Person dialog. The link carries
+                    // only a public id — never a key — so it's safe to share anywhere.
+                    Button {
+                        Platform.share("findfamily://add/\(myIDStr)")
+                    } label: {
+                        HStack {
+                            Image(systemName: "square.and.arrow.up")
+                            Text(Strings.shareInviteLink)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                    }
                 }
                 Section(Strings.addPersonTheirID) {
                     if presetID != nil {
