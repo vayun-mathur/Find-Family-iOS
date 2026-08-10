@@ -204,8 +204,22 @@ final class Networking: ObservableObject {
     /// Computes the RSA verification "security code" (safety number) for a connection: a
     /// fingerprint of both this device's and [user]'s public keys, identical on both peers.
     /// Comparing them out-of-band confirms no key was substituted. Returns nil if the peer's
-    /// key isn't known yet. Uses RSA keys to match Android's current SecurityCodeDialog.
+    /// key isn't known yet.
+    ///
+    /// Prefers the PQC (quantum-safe) code when both sides support PQC, falling back to the RSA
+    /// code otherwise. The choice is symmetric: PQC is used iff this device is PQC-capable AND the
+    /// peer has a PQC bundle available, so if either side lacks PQC both compute the RSA code.
+    /// The heavy SHA-256 ×4000 runs off the main actor (`Networking` is @MainActor); only `Data`
+    /// (Sendable) crosses the boundary.
     func securityCode(for user: User) async -> String? {
+        // Prefer PQC when both sides support it.
+        if pqcAvailable, let myBundle = pqcIdentity?.publicBundle,
+           let peerBundle = await resolvedPqcBundle(for: user) {
+            return await Task.detached(priority: .userInitiated) {
+                PQCSecurityCode.compute(myBundle: myBundle, theirBundle: peerBundle)
+            }.value
+        }
+        // RSA fallback.
         guard let selfPub = publicKey else { return nil }
         // Prefer the cached peer key; otherwise fetch and cache it atomically.
         var peerKey: SecKey?
@@ -221,9 +235,6 @@ final class Networking: ObservableObject {
             peerKey = k
         }
         guard let peer = peerKey else { return nil }
-        // Extract canonical DER on the main actor (cheap), then run the SHA-256 ×4000
-        // iteration off the main actor — `Networking` is @MainActor, so a plain call would
-        // otherwise block the UI. Only `Data` (Sendable) crosses the boundary.
         guard let myDer = RSASecurityCode.canonicalDER(selfPub),
               let theirDer = RSASecurityCode.canonicalDER(peer) else { return nil }
         return await Task.detached(priority: .userInitiated) {
