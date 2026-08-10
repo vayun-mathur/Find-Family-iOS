@@ -86,7 +86,6 @@ final class BackgroundTask {
     private var lastUpdateAt: Date = .distantPast
     private var tickCount = 0
     private var lastBatteryLevels: [Int64: Float] = [:]
-    private var lastUserLocationName: [Int64: String] = [:]
     private var isProcessing = false
 
     /// Last location delivered by CoreLocation. Cached so the timer-driven
@@ -150,28 +149,20 @@ final class BackgroundTask {
         tickCount += 1
         if tickCount % 100 == 1 { _ = await Networking.shared.ensureUserExists() }
 
-        // 1. Reverse geocode -> "Home" / "Unnamed Location" placeholder.
-        var myPlaceName = "Unnamed Location"
-        if let placemarks = try? await geocoder.reverseGeocodeLocation(loc),
-           let p = placemarks.first {
-            myPlaceName = [p.name, p.locality].compactMap { $0 }.first ?? "Unnamed Location"
-        }
-
-        // 2. Waypoint enter/exit using haversine.
-        let waypoints = Database.shared.waypointsSubject.value
-        for wp in waypoints {
-            let dist = haversine(coord, wp.coord)
-            if dist < wp.range { myPlaceName = wp.name; break }
-        }
-
-        // Update the local "Me" user's locationName + persist our own LocationValue so
-        // we appear on the map and our own history works.
+        // 1 + 2. Persist our own fix, then compute our current waypoint (with 1.2× exit
+        // hysteresis) and a display name. Uses the atomic partial update so timers/flags
+        // set elsewhere (sharingAutoToggleAt / sendingEnabled) aren't clobbered.
         Database.shared.insertLocationValue(me)
-        if var meUser = Database.shared.user(id: Networking.shared.userid) {
-            if meUser.locationName != myPlaceName {
-                meUser.locationName = myPlaceName
-                meUser.lastLocationChangeTime = Date()
-                Database.shared.upsertUser(meUser)
+        if let meUser = Database.shared.user(id: Networking.shared.userid) {
+            let (currentId, resolvedName) = await resolveWaypoint(coord: coord, prevId: meUser.lastWaypointId)
+            let displayName = resolvedName ?? (meUser.locationName.isEmpty ? "Unnamed Location" : meUser.locationName)
+            if currentId != meUser.lastWaypointId || displayName != meUser.locationName {
+                Database.shared.updateLocationMeta(
+                    id: meUser.id,
+                    locationName: displayName,
+                    lastWaypointId: currentId,
+                    lastLocationChangeTime: Date()
+                )
             }
         }
 
@@ -181,11 +172,13 @@ final class BackgroundTask {
             Database.shared.deleteTemporaryLink(link)
         }
 
-        // 4. Publish my location to EVERY user in our database (matches Modern-Apps
-        // behavior — there's no `sendingEnabled` / `mutualConnection` filter at this
-        // layer; discovery happens implicitly via location publishing).
+        // 4. Apply any due auto-toggle timers, then publish. Mirrors Android: flip
+        // `sendingEnabled` atomically for due timers, then publish only to peers with
+        // sharing enabled (`id != me && sendingEnabled`) so the "Share your location"
+        // toggle — and the auto-toggle countdown — are actually honored.
+        Database.shared.applyDueAutoToggles(now: now)
         let users = Database.shared.usersSubject.value
-        for u in users where u.id != Networking.shared.userid {
+        for u in users where u.id != Networking.shared.userid && u.sendingEnabled {
             _ = await Networking.shared.publishLocation(me, toUser: u)
         }
         for link in Database.shared.temporaryLinksSubject.value {
@@ -242,37 +235,65 @@ final class BackgroundTask {
         }
     }
 
+    /// Computes the current waypoint id for a coordinate with 1.2× exit hysteresis and a
+    /// display name, mirroring Android `syncHeartbeat`. To *enter* a waypoint you must be
+    /// within its radius; to *remain* in the previously-entered waypoint you only need to be
+    /// within 1.2× the radius (prevents flapping at the boundary). The returned name prefers
+    /// the entered/sticky waypoint name, then a reverse-geocoded address, else nil (unresolved).
+    private func resolveWaypoint(coord: Coord, prevId: Int64?) async -> (currentId: Int64?, name: String?) {
+        let waypoints = Database.shared.waypointsSubject.value
+        let inWaypoint = waypoints.first { haversine(coord, $0.coord) < $0.range }
+        let stillInsidePrev: Bool = {
+            guard let pid = prevId, let wp = waypoints.first(where: { $0.id == pid }) else { return false }
+            return haversine(coord, wp.coord) < wp.range * 1.2
+        }()
+        let currentId: Int64? = inWaypoint?.id ?? (stillInsidePrev ? prevId : nil)
+        if let name = inWaypoint?.name { return (currentId, name) }
+        if let cid = currentId, let wp = waypoints.first(where: { $0.id == cid }) {
+            return (currentId, wp.name)
+        }
+        if let placemarks = try? await geocoder.reverseGeocodeLocation(
+            CLLocation(latitude: coord.lat, longitude: coord.lon)
+        ), let p = placemarks.first {
+            return (currentId, [p.name, p.locality].compactMap { $0 }.first)
+        }
+        return (currentId, nil)
+    }
+
     private func updateUserLocationName(_ loc: LocationValue) async {
-        guard var user = Database.shared.user(id: loc.userid) else { return }
-        // Recompute the display name on every incoming fix: prefer a matching waypoint,
-        // otherwise reverse-geocode the fresh coordinate. This mirrors the local "Me"
-        // handling above and Android's heartbeat. Previously the geocode only ran while
-        // the stored name was still "Unnamed Location", so once a peer had any real name
-        // it never refreshed and the main-page list showed a location stuck for weeks.
-        var newName: String?
-        for wp in Database.shared.waypointsSubject.value {
-            if haversine(loc.coord, wp.coord) < wp.range { newName = wp.name; break }
+        guard let user = Database.shared.user(id: loc.userid) else { return }
+        // Recompute waypoint (with hysteresis) + display name on every incoming fix. Prefer a
+        // matching waypoint, otherwise reverse-geocode. Keep the existing name if we can't
+        // resolve a fresh one rather than clobbering it.
+        let prevId = user.lastWaypointId
+        let (currentId, resolvedName) = await resolveWaypoint(coord: loc.coord, prevId: prevId)
+        let resolved = resolvedName ?? user.locationName
+        if currentId != prevId || resolved != user.locationName {
+            // Atomic partial update — avoids a stale snapshot clobbering
+            // sharingAutoToggleAt / sendingEnabled.
+            Database.shared.updateLocationMeta(
+                id: user.id,
+                locationName: resolved,
+                lastWaypointId: currentId,
+                lastLocationChangeTime: Date()
+            )
         }
-        if newName == nil,
-           let placemarks = try? await geocoder.reverseGeocodeLocation(
-               CLLocation(latitude: loc.coord.lat, longitude: loc.coord.lon)
-           ), let p = placemarks.first {
-            newName = [p.name, p.locality].compactMap { $0 }.first
-        }
-        // If we couldn't resolve a fresh name, keep the existing one rather than clobbering it.
-        let resolved = newName ?? user.locationName
-        if resolved != user.locationName {
-            user.locationName = resolved
-            user.lastLocationChangeTime = Date()
-            Database.shared.upsertUser(user)
-            if let prev = lastUserLocationName[user.id], prev != resolved {
-                NotificationsUtil.send(
-                    title: Strings.notifWaypointEnterTitle,
-                    body: Strings.notifWaypointEnterBody(user.name, resolved),
-                    category: "WAYPOINT_ENTER_EXIT"
-                )
-            }
-            lastUserLocationName[user.id] = resolved
+        // Enter/exit notifications fire only on an actual waypoint transition.
+        guard currentId != prevId else { return }
+        if currentId != nil {
+            let enteredName = Database.shared.waypointsSubject.value.first { $0.id == currentId }?.name ?? resolved
+            NotificationsUtil.send(
+                title: Strings.notifWaypointEnterTitle,
+                body: Strings.notifWaypointEnterBody(user.name, enteredName),
+                category: "WAYPOINT_ENTER_EXIT"
+            )
+        } else if let pid = prevId {
+            let exitedName = Database.shared.waypointsSubject.value.first { $0.id == pid }?.name ?? user.locationName
+            NotificationsUtil.send(
+                title: Strings.notifWaypointExitTitle,
+                body: Strings.notifWaypointExitBody(user.name, exitedName),
+                category: "WAYPOINT_ENTER_EXIT"
+            )
         }
     }
 
@@ -280,7 +301,8 @@ final class BackgroundTask {
         let prev = lastBatteryLevels[loc.userid]
         lastBatteryLevels[loc.userid] = loc.battery
         guard let prev = prev else { return }
-        if prev > 20 && loc.battery <= 20 {
+        // Edge-triggered at 15% (matches Android): one alert as a peer crosses the threshold.
+        if prev > 15 && loc.battery <= 15 {
             if let user = Database.shared.user(id: loc.userid) {
                 NotificationsUtil.send(
                     title: Strings.notifBatteryLowTitle,

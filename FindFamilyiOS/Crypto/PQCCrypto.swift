@@ -126,37 +126,9 @@ enum PQCAES {
 // MARK: - Security code (same as Kotlin SecurityCode.compute)
 
 enum PQCSecurityCode {
-    private static let iterations = 4000
-
     /// Computes a 6-group 5-digit safety number from two public bundles, identical both sides.
     static func compute(myBundle: Data, theirBundle: Data) -> String {
-        let a = sha256(myBundle)
-        let b = sha256(theirBundle)
-        // canonical order
-        var h: Data
-        if a.lexicographicallyPrecedes(b) { h = a + b } else { h = b + a }
-        for _ in 0..<iterations { h = sha256(h) }
-        return format(h)
-    }
-
-    private static func sha256(_ d: Data) -> Data {
-        Data(SHA256.hash(data: d))
-    }
-
-    private static func format(_ h: Data) -> String {
-        var sb = ""
-        var idx = 0
-        for group in 0..<6 {
-            guard idx + 5 <= h.count else { break }
-            var v: UInt64 = 0
-            for j in 0..<5 {
-                v = (v << 8) | UInt64(h[idx + j])
-            }
-            if group > 0 { sb.append(" ") }
-            sb.append(String(format: "%05d", v % 100000))
-            idx += 5
-        }
-        return sb
+        SecurityCodeFormat.compute(myBundle, theirBundle)
     }
 }
 

@@ -53,6 +53,7 @@ struct MainView: View {
     @State private var addPersonId: Int64?
     @State private var showAddLinkDialog = false
     @State private var showMissingFeaturesDialog = false
+    @State private var showSecurityCode = false
 
     @State private var mapCenter = MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194),
@@ -116,6 +117,11 @@ struct MainView: View {
             .sheet(isPresented: $showAddLinkDialog) {
                 AddLinkDialog(isPresented: $showAddLinkDialog)
             }
+            .sheet(isPresented: $showSecurityCode) {
+                if let uid = selectedUserId, let user = vm.users.first(where: { $0.id == uid }) {
+                    SecurityCodeView(user: user, isPresented: $showSecurityCode)
+                }
+            }
             .alert(Strings.missingFeaturesTitle, isPresented: $showMissingFeaturesDialog) {
                 Button(Strings.okButton, role: .cancel) {}
             } message: { Text(Strings.missingFeaturesExplanation) }
@@ -163,6 +169,9 @@ struct MainView: View {
                 BackupButtons()
             } else if let uid = selectedUserId, uid != Networking.shared.userid,
                       let user = vm.users.first(where: { $0.id == uid }) {
+                Button {
+                    showSecurityCode = true
+                } label: { Image(systemName: "checkmark.shield") }
                 Button(role: .destructive) {
                     Database.shared.deleteUser(user)
                     selectedUserId = nil
@@ -247,9 +256,12 @@ struct MainView: View {
                         Database.shared.upsertUser(u)
                     },
                     onToggleSending: { send in
-                        var u = user
-                        u.sendingEnabled = send
-                        Database.shared.upsertUser(u)
+                        // Manual toggle clears any pending auto-toggle (atomic, no clobber).
+                        Database.shared.setSendingEnabledAndClearToggle(id: user.id, enabled: send)
+                    },
+                    onSetAutoToggle: { seconds in
+                        let at = seconds.map { Date().addingTimeInterval($0) }
+                        Database.shared.setSharingAutoToggleAt(id: user.id, at: at)
                     }
                 )
                 .padding(.vertical, 12)

@@ -156,7 +156,60 @@ struct AddPersonDialog: View {
     }
 }
 
-// MARK: - AddLinkDialog
+// MARK: - SecurityCodeView
+
+/// Displays the RSA safety number for a connection so both users can compare it out-of-band
+/// (mirrors Android's SecurityCodeDialog). The code is computed off the main actor since it
+/// runs SHA-256 ×4000. If the peer's key isn't available yet, an explanatory state is shown.
+struct SecurityCodeView: View {
+    let user: User
+    @Binding var isPresented: Bool
+
+    @State private var code: String?
+    @State private var loading = true
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                Text(Strings.securityCodeCompare(user.name))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                if loading {
+                    ProgressView().padding(.top, 8)
+                    Text(Strings.securityCodeComputing).font(.caption).foregroundStyle(.secondary)
+                } else if let code = code {
+                    Text(code)
+                        .font(.title2.monospaced())
+                        .multilineTextAlignment(.center)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
+                } else {
+                    Text(Strings.securityCodeUnavailable(user.name))
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle(Strings.securityCodeTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(Strings.doneButton) { isPresented = false }
+                }
+            }
+            .task {
+                let result = await Networking.shared.securityCode(for: user)
+                code = result
+                loading = false
+            }
+        }
+    }
+}
 
 struct AddLinkDialog: View {
     @Binding var isPresented: Bool
@@ -226,7 +279,12 @@ struct AddLinkDialog: View {
                     print("AddLink: PQC ephemeral unavailable (native not linked?): \(error.localizedDescription)")
                 }
                 let link = TemporaryLink(
-                    id: 0,
+                    // A link id is the server-side recipient id (what `/view/<id>` resolves to)
+                    // and shares the random 64-bit namespace of userids. Room-style autoincrement
+                    // made every device's first link id 1, so every `/view/1` collided on one
+                    // server queue. Use a random positive Int64 instead (mirrors Android
+                    // newTemporaryLinkId()); this routes through the explicit-id INSERT OR REPLACE.
+                    id: Int64.random(in: 1...Int64.max),
                     name: name.trimmingCharacters(in: .whitespaces),
                     key: priB64,
                     publicKey: pubB64,

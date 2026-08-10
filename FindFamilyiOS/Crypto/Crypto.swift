@@ -354,6 +354,56 @@ private struct ASN1Parser {
     }
 }
 
+// MARK: - Security code formatting (shared by PQC + RSA safety numbers)
+
+/// Formats an iterated hash into a 6-group, 5-digit safety number, and runs the shared
+/// canonical-order iterated-SHA256 computation. Identical to Kotlin `SecurityCode`.
+enum SecurityCodeFormat {
+    static let iterations = 4000
+
+    /// SHA-256(a) and SHA-256(b) are combined in canonical (sorted) order, then hashed
+    /// `iterations` times, then formatted. Both peers compute the same code regardless of role.
+    static func compute(_ aDigestInput: Data, _ bDigestInput: Data) -> String {
+        let a = sha256(aDigestInput)
+        let b = sha256(bDigestInput)
+        var h = a.lexicographicallyPrecedes(b) ? a + b : b + a
+        for _ in 0..<iterations { h = sha256(h) }
+        return format(h)
+    }
+
+    static func sha256(_ d: Data) -> Data { Data(SHA256.hash(data: d)) }
+
+    /// 6 groups of 5 bytes → big-endian UInt64 → `% 100000`, zero-padded, space-separated.
+    static func format(_ h: Data) -> String {
+        var sb = ""
+        var idx = 0
+        for group in 0..<6 {
+            guard idx + 5 <= h.count else { break }
+            var v: UInt64 = 0
+            for j in 0..<5 { v = (v << 8) | UInt64(h[h.startIndex + idx + j]) }
+            if group > 0 { sb.append(" ") }
+            sb.append(String(format: "%05d", v % 100000))
+            idx += 5
+        }
+        return sb
+    }
+}
+
+// MARK: - RSA security code (safety number over canonical X.509 SPKI DER)
+
+/// Computes the RSA safety number matching Android's `E2ee.securityCode`, which hashes the
+/// **canonical DER** (X.509 SubjectPublicKeyInfo) of each RSA public key. iOS `SecKey` gives
+/// PKCS#1, so we wrap to SPKI first to match the Android encoding byte-for-byte. Callers pass
+/// the two canonical DERs to `SecurityCodeFormat.compute` (run off the main actor).
+enum RSASecurityCode {
+    /// Canonical X.509 SPKI DER for an RSA public SecKey (PKCS#1 → SPKI), matching Android.
+    static func canonicalDER(_ key: SecKey) -> Data? {
+        var err: Unmanaged<CFError>?
+        guard let pkcs1 = SecKeyCopyExternalRepresentation(key, &err) as Data? else { return nil }
+        return RSAPEM.wrapX509SPKI(pkcs1: pkcs1)
+    }
+}
+
 // MARK: - Base26
 
 /// Encodes a Long id using uppercase A..Z digits. Mirrors `encodeBase26` in the Modern-Apps library.

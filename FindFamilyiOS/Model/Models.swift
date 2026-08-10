@@ -61,11 +61,18 @@ struct User: Identifiable, Codable, Hashable, Equatable {
     /// Post-quantum public bundle (base64 of [4B kemLen][kemPubDer][dsaPubDer]), nullable for migration.
     /// Same format as Android Office `Pqc.bundle` / `ff_pqc` key directory.
     var pqcEncryptionKey: String? = nil
+    /// Id of the waypoint this user is currently inside, used for enter/exit hysteresis.
+    /// Nullable for migration and when the user is outside every waypoint.
+    var lastWaypointId: Int64? = nil
+    /// Deadline at which `sendingEnabled` auto-flips (the "Disable/Enable after" timer).
+    /// `nil` means "Never" (no pending auto-toggle). Nullable for migration.
+    var sharingAutoToggleAt: Date? = nil
 
     static let empty = User(
         id: 0, name: "", photo: nil, locationName: "Unnamed Location",
         sendingEnabled: false, requestStatus: .mutualConnection,
-        lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil, pqcEncryptionKey: nil
+        lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil, pqcEncryptionKey: nil,
+        lastWaypointId: nil, sharingAutoToggleAt: nil
     )
 }
 

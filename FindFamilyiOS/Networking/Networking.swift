@@ -97,6 +97,9 @@ final class Networking: ObservableObject {
 
             isReady = true
             ensureMeUserExists()
+            // Apply any auto-toggle timers that fell due while the app was not running
+            // (mirrors Android's cold-start applyDueAutoToggles in the ViewModel init).
+            Database.shared.applyDueAutoToggles(now: Date())
             _ = await ensureUserExists()
         } catch {
             print("Networking.start error: \(error)")
@@ -147,12 +150,29 @@ final class Networking: ObservableObject {
 
     func ensureUserExists() async -> Bool {
         var ok = true
-        if await getKey(forUserid: userid) == nil {
+        // RSA self-heal: re-register if the server has no key OR a key that differs from ours.
+        // A DataStore/Keychain race on first launch could have registered an ephemeral key, so
+        // peers would encrypt to the wrong pubkey. Detect the mismatch by comparing the base64
+        // of the server's returned public key against our own PEM.
+        if let serverKey = await getKey(forUserid: userid) {
+            if let serverPem = try? RSAPEM.publicKeyToPEM(serverKey) {
+                let serverB64 = Data(serverPem.utf8).base64EncodedString()
+                if serverB64 != publicKeyPEMBase64 {
+                    print("Networking: server RSA key mismatch for self, re-registering")
+                    ok = await register() && ok
+                }
+            }
+        } else {
             ok = await register() && ok
         }
-        // PQC self-healing: ensure PQC key registered too if available.
+        // PQC self-healing: same missing-or-mismatched detection for the PQC bundle.
         if pqcAvailable {
-            if await getPqcKeyRaw(forUserid: userid) == nil {
+            if let serverBundle = await getPqcKeyRaw(forUserid: userid) {
+                if serverBundle.base64EncodedString() != pqcPublicBundleB64 {
+                    print("Networking: server PQC bundle mismatch for self, re-registering")
+                    ok = await registerPqc() && ok
+                }
+            } else {
                 ok = await registerPqc() && ok
             }
         }
@@ -181,7 +201,35 @@ final class Networking: ObservableObject {
         }
     }
 
-    // MARK: - PQC key fetch (raw bundle)
+    /// Computes the RSA verification "security code" (safety number) for a connection: a
+    /// fingerprint of both this device's and [user]'s public keys, identical on both peers.
+    /// Comparing them out-of-band confirms no key was substituted. Returns nil if the peer's
+    /// key isn't known yet. Uses RSA keys to match Android's current SecurityCodeDialog.
+    func securityCode(for user: User) async -> String? {
+        guard let selfPub = publicKey else { return nil }
+        // Prefer the cached peer key; otherwise fetch and cache it atomically.
+        var peerKey: SecKey?
+        if let encKeyB64 = user.encryptionKey,
+           let pemData = Data(base64Encoded: encKeyB64),
+           let pem = String(data: pemData, encoding: .utf8) {
+            peerKey = RSAPEM.publicKeyFromPEM(pem)
+        }
+        if peerKey == nil, let k = await getKey(forUserid: user.id) {
+            if let pem = try? RSAPEM.publicKeyToPEM(k) {
+                Database.shared.setEncryptionKey(id: user.id, encryptionKey: Data(pem.utf8).base64EncodedString())
+            }
+            peerKey = k
+        }
+        guard let peer = peerKey else { return nil }
+        // Extract canonical DER on the main actor (cheap), then run the SHA-256 ×4000
+        // iteration off the main actor — `Networking` is @MainActor, so a plain call would
+        // otherwise block the UI. Only `Data` (Sendable) crosses the boundary.
+        guard let myDer = RSASecurityCode.canonicalDER(selfPub),
+              let theirDer = RSASecurityCode.canonicalDER(peer) else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            SecurityCodeFormat.compute(myDer, theirDer)
+        }.value
+    }
 
     /// Raw PQC bundle Data fetch (base64 decoded), for registration self-heal check.
     func getPqcKeyRaw(forUserid id: Int64) async -> Data? {
@@ -208,12 +256,9 @@ final class Networking: ObservableObject {
     func getPqcBundle(forUserid id: Int64) async -> Data? {
         guard pqcAvailable else { return nil }
         if let data = await getPqcKeyRaw(forUserid: id) {
-            // cache
-            if var u = Database.shared.user(id: id), u.pqcEncryptionKey == nil {
-                u.pqcEncryptionKey = data.base64EncodedString()
-                Database.shared.upsertUser(u)
-            } else if Database.shared.user(id: id) == nil {
-                // We have a bundle but no user yet — user will be created by location receive path.
+            // Cache atomically so we don't clobber other columns (sharingAutoToggleAt etc.).
+            if let u = Database.shared.user(id: id), u.pqcEncryptionKey == nil {
+                Database.shared.setPqcEncryptionKey(id: id, pqcEncryptionKey: data.base64EncodedString())
             }
             return data
         }
@@ -254,13 +299,10 @@ final class Networking: ObservableObject {
            let k = RSAPEM.publicKeyFromPEM(pem) {
             key = k
         } else if let k = await getKey(forUserid: user.id) {
-            do {
-                let pem = try RSAPEM.publicKeyToPEM(k)
+            if let pem = try? RSAPEM.publicKeyToPEM(k) {
                 let b64 = Data(pem.utf8).base64EncodedString()
-                var copy = user
-                copy.encryptionKey = b64
-                Database.shared.upsertUser(copy)
-            } catch {}
+                Database.shared.setEncryptionKey(id: user.id, encryptionKey: b64)
+            }
             key = k
         } else {
             key = nil
@@ -358,10 +400,9 @@ final class Networking: ObservableObject {
                     let loc = comp.toLocationValue()
                     out.append(loc)
                     if let platform = comp.senderPlatform,
-                       var u = Database.shared.user(id: loc.userid),
+                       let u = Database.shared.user(id: loc.userid),
                        u.platform != platform {
-                        u.platform = platform
-                        Database.shared.upsertUser(u)
+                        Database.shared.setPlatform(id: loc.userid, platform: platform)
                     }
                 } catch {
                     print("receiveLocationsClassic: decrypt/parse failure: \(error.localizedDescription)")
@@ -399,10 +440,9 @@ final class Networking: ObservableObject {
                     let loc = comp.toLocationValue()
                     out.append(loc)
                     if let platform = comp.senderPlatform,
-                       var u = Database.shared.user(id: loc.userid),
+                       let u = Database.shared.user(id: loc.userid),
                        u.platform != platform {
-                        u.platform = platform
-                        Database.shared.upsertUser(u)
+                        Database.shared.setPlatform(id: loc.userid, platform: platform)
                     }
                 } catch {
                     print("receiveLocationsPqc: decrypt/parse failure: \(error.localizedDescription)")

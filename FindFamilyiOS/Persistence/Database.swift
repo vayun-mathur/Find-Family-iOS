@@ -63,6 +63,14 @@ final class Database {
             // PQC bundle cache (base64 of [4B kemLen][kemPubDer][dsaPubDer]) — same format as Office.
             exec("ALTER TABLE users ADD COLUMN pqcEncryptionKey TEXT;")
         }
+        if !columnExists(table: "users", column: "lastWaypointId") {
+            // Waypoint enter/exit hysteresis state (nullable). Additive migration only.
+            exec("ALTER TABLE users ADD COLUMN lastWaypointId INTEGER;")
+        }
+        if !columnExists(table: "users", column: "sharingAutoToggleAt") {
+            // Auto-toggle deadline in epoch seconds (nullable = "Never"). Additive migration only.
+            exec("ALTER TABLE users ADD COLUMN sharingAutoToggleAt INTEGER;")
+        }
         exec("""
         CREATE TABLE IF NOT EXISTS waypoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -140,8 +148,8 @@ final class Database {
     func upsertUser(_ u: User) {
         queue.sync {
             let sql = """
-            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
@@ -155,9 +163,124 @@ final class Database {
             bindOptionalText(stmt, 8, u.encryptionKey)
             bindOptionalText(stmt, 9, u.platform)
             bindOptionalText(stmt, 10, u.pqcEncryptionKey)
+            bindOptionalInt64(stmt, 11, u.lastWaypointId)
+            bindOptionalInt64(stmt, 12, u.sharingAutoToggleAt.map { Int64($0.timeIntervalSince1970) })
             sqlite3_step(stmt)
             sqlite3_finalize(stmt)
             usersSubject.send(loadUsers())
+        }
+    }
+
+    // MARK: - Atomic partial updates
+    //
+    // These mirror Android's UserDao partial-update queries. Whole-row `upsertUser`
+    // from a stale snapshot would clobber columns another path just wrote
+    // (e.g. `sharingAutoToggleAt` / `sendingEnabled`), so hot paths use these instead.
+
+    /// Atomically update location display metadata without touching sharing/toggle columns.
+    func updateLocationMeta(id: Int64, locationName: String, lastWaypointId: Int64?, lastLocationChangeTime: Date) {
+        queue.sync {
+            let sql = "UPDATE users SET locationName = ?, lastWaypointId = ?, lastLocationChangeTime = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, locationName)
+            bindOptionalInt64(stmt, 2, lastWaypointId)
+            sqlite3_bind_int64(stmt, 3, Int64(lastLocationChangeTime.timeIntervalSince1970))
+            sqlite3_bind_int64(stmt, 4, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically set the learned peer platform tag.
+    func setPlatform(id: Int64, platform: String) {
+        queue.sync {
+            let sql = "UPDATE users SET platform = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, platform)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically cache a peer's RSA public key (base64 PEM).
+    func setEncryptionKey(id: Int64, encryptionKey: String) {
+        queue.sync {
+            let sql = "UPDATE users SET encryptionKey = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, encryptionKey)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically cache a peer's PQC public bundle (base64).
+    func setPqcEncryptionKey(id: Int64, pqcEncryptionKey: String) {
+        queue.sync {
+            let sql = "UPDATE users SET pqcEncryptionKey = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, pqcEncryptionKey)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically set only the auto-toggle deadline (nil = "Never"). Avoids clobbering other columns.
+    func setSharingAutoToggleAt(id: Int64, at: Date?) {
+        queue.sync {
+            let sql = "UPDATE users SET sharingAutoToggleAt = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindOptionalInt64(stmt, 1, at.map { Int64($0.timeIntervalSince1970) })
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically set sharing enabled AND clear any pending auto-toggle (manual toggle path).
+    func setSendingEnabledAndClearToggle(id: Int64, enabled: Bool) {
+        queue.sync {
+            let sql = "UPDATE users SET sendingEnabled = ?, sharingAutoToggleAt = NULL WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            sqlite3_bind_int(stmt, 1, enabled ? 1 : 0)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically flip sharing for every row whose timer is due, clearing the timer.
+    /// The WHERE clause guards against TOCTOU races: if the user manually cleared (NULL)
+    /// or rescheduled to the future, the row no longer matches. Returns rows flipped.
+    @discardableResult
+    func applyDueAutoToggles(now: Date) -> Int {
+        queue.sync {
+            let nowEpoch = Int64(now.timeIntervalSince1970)
+            let sql = "UPDATE users SET sendingEnabled = CASE WHEN sendingEnabled THEN 0 ELSE 1 END, sharingAutoToggleAt = NULL WHERE sharingAutoToggleAt IS NOT NULL AND sharingAutoToggleAt <= ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            sqlite3_bind_int64(stmt, 1, nowEpoch)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            let changed = Int(sqlite3_changes(db))
+            if changed > 0 {
+                usersSubject.send(loadUsers())
+            }
+            return changed
         }
     }
 
@@ -172,12 +295,13 @@ final class Database {
 
     private func loadUsers() -> [User] {
         var out: [User] = []
-        // pqcEncryptionKey column added via idempotent migration; SELECT explicitly to handle older dbs.
-        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey FROM users;"
+        // pqcEncryptionKey/lastWaypointId/sharingAutoToggleAt columns added via idempotent
+        // migrations; SELECT explicitly to handle older dbs (see rc-fallback below).
+        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt FROM users;"
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
-            // Fallback: older schema without pqcEncryptionKey (should be migrated, but be safe during dev).
+            // Fallback: older schema without the newer columns (should be migrated, but be safe during dev).
             sqlite3_finalize(stmt)
             let sql2 = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform FROM users;"
             sqlite3_prepare_v2(db, sql2, -1, &stmt, nil)
@@ -192,7 +316,9 @@ final class Database {
                     lastLocationChangeTime: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6))),
                     encryptionKey: text(stmt, 7),
                     platform: text(stmt, 8),
-                    pqcEncryptionKey: nil
+                    pqcEncryptionKey: nil,
+                    lastWaypointId: nil,
+                    sharingAutoToggleAt: nil
                 ))
             }
             sqlite3_finalize(stmt)
@@ -209,7 +335,9 @@ final class Database {
                 lastLocationChangeTime: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6))),
                 encryptionKey: text(stmt, 7),
                 platform: text(stmt, 8),
-                pqcEncryptionKey: text(stmt, 9)
+                pqcEncryptionKey: text(stmt, 9),
+                lastWaypointId: optInt64(stmt, 10),
+                sharingAutoToggleAt: optInt64(stmt, 11).map { Date(timeIntervalSince1970: TimeInterval($0)) }
             ))
         }
         sqlite3_finalize(stmt)
@@ -442,6 +570,12 @@ final class Database {
         return String(cString: cstr)
     }
 
+    /// Reads a nullable INTEGER column, returning nil for SQL NULL.
+    private func optInt64(_ stmt: OpaquePointer?, _ idx: Int32) -> Int64? {
+        if sqlite3_column_type(stmt, idx) == SQLITE_NULL { return nil }
+        return sqlite3_column_int64(stmt, idx)
+    }
+
     private func bindText(_ stmt: OpaquePointer?, _ idx: Int32, _ s: String) {
         sqlite3_bind_text(stmt, idx, (s as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
     }
@@ -449,6 +583,14 @@ final class Database {
     private func bindOptionalText(_ stmt: OpaquePointer?, _ idx: Int32, _ s: String?) {
         if let s = s {
             bindText(stmt, idx, s)
+        } else {
+            sqlite3_bind_null(stmt, idx)
+        }
+    }
+
+    private func bindOptionalInt64(_ stmt: OpaquePointer?, _ idx: Int32, _ v: Int64?) {
+        if let v = v {
+            sqlite3_bind_int64(stmt, idx, v)
         } else {
             sqlite3_bind_null(stmt, idx)
         }

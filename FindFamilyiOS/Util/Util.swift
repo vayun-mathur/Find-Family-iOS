@@ -93,9 +93,39 @@ enum Strings {
     static func notifBatteryLowBody(_ name: String, _ pct: Int) -> String { "\(name)'s battery is at \(pct)%" }
     static let notifWaypointEnterTitle = "Place Update"
     static func notifWaypointEnterBody(_ name: String, _ place: String) -> String { "\(name) is at \(place)" }
+    static let notifWaypointExitTitle = "Place Update"
+    static func notifWaypointExitBody(_ name: String, _ place: String) -> String { "\(name) left \(place)" }
 
     static let okButton = "OK"
     static let cancelButton = "Cancel"
+    static let doneButton = "Done"
+
+    // Auto-toggle sharing ("Disable/Enable after" timer)
+    static let autoToggleNever = "Never"
+    static let disableAfter = "Disable after"
+    static let enableAfter = "Enable after"
+
+    // Duration options (shared with temporary-link expiry)
+    static let duration15Minutes = "15 minutes"
+    static let duration30Minutes = "30 minutes"
+    static let duration1Hour = "1 hour"
+    static let duration2Hours = "2 hours"
+    static let duration4Hours = "4 hours"
+    static let duration6Hours = "6 hours"
+    static let duration12Hours = "12 hours"
+    static let duration1Day = "1 day"
+    static let duration2Days = "2 days"
+    static let duration1Week = "1 week"
+
+    // Security code (safety number) verification
+    static let securityCodeTitle = "Security Code"
+    static func securityCodeCompare(_ name: String) -> String {
+        "Compare this code with the one shown on \(name)'s device. If they match, your connection is verified and no one is intercepting it."
+    }
+    static let securityCodeComputing = "Computing…"
+    static func securityCodeUnavailable(_ name: String) -> String {
+        "Couldn't compute the code yet — \(name)'s key isn't available. Try again once they've shared their location."
+    }
 
     // PQC broken-lock info box (shown when tapping red lock for non-PQC peers)
     static let pqcUnprotectedTitle = "Quantum protection"

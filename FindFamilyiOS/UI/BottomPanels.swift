@@ -59,6 +59,7 @@ struct UserDetailPanel: View {
     let latest: LocationValue?
     let onChangeContact: (String, String?) -> Void
     let onToggleSending: (Bool) -> Void
+    let onSetAutoToggle: (TimeInterval?) -> Void
 
     @State private var showPqcInfo = false
 
@@ -78,11 +79,14 @@ struct UserDetailPanel: View {
                 }
                 .buttonStyle(.plain)
             }
-            HStack {
-                Text(Strings.shareYourLocation)
-                Spacer()
-                Toggle("", isOn: Binding(get: { user.sendingEnabled }, set: { onToggleSending($0) }))
-                    .labelsHidden()
+            VStack(spacing: 8) {
+                HStack {
+                    Text(Strings.shareYourLocation)
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { user.sendingEnabled }, set: { onToggleSending($0) }))
+                        .labelsHidden()
+                }
+                AutoToggleRow(user: user, onSet: onSetAutoToggle)
             }
             .padding(12)
             .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
@@ -107,6 +111,77 @@ struct UserDetailPanel: View {
         } message: {
             Text(Strings.pqcUnprotectedMessage)
         }
+    }
+}
+
+// MARK: - Auto-toggle row ("Disable/Enable after" timer with live countdown)
+
+/// Mirrors Android `AutoToggleRow`: a menu of durations that schedules an auto-flip of
+/// `sendingEnabled`, plus a live 1-second countdown. "Never" cancels a pending timer.
+struct AutoToggleRow: View {
+    let user: User
+    let onSet: (TimeInterval?) -> Void
+
+    @State private var now = Date()
+
+    private static let options: [(label: String, seconds: TimeInterval)] = [
+        (Strings.duration15Minutes, 15 * 60),
+        (Strings.duration30Minutes, 30 * 60),
+        (Strings.duration1Hour, 60 * 60),
+        (Strings.duration2Hours, 2 * 60 * 60),
+        (Strings.duration4Hours, 4 * 60 * 60),
+        (Strings.duration6Hours, 6 * 60 * 60),
+        (Strings.duration12Hours, 12 * 60 * 60),
+        (Strings.duration1Day, 24 * 60 * 60),
+        (Strings.duration2Days, 2 * 24 * 60 * 60),
+        (Strings.duration1Week, 7 * 24 * 60 * 60),
+    ]
+
+    /// Ticks once per second while a timer is pending so the countdown stays live.
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private var currentLabel: String {
+        guard let endAt = user.sharingAutoToggleAt else { return Strings.autoToggleNever }
+        let remaining = endAt.timeIntervalSince(now)
+        if remaining <= 0 { return Strings.autoToggleNever }
+        return Self.formatCountdown(remaining)
+    }
+
+    private var leadingLabel: String {
+        user.sendingEnabled ? Strings.disableAfter : Strings.enableAfter
+    }
+
+    var body: some View {
+        HStack {
+            Text(leadingLabel)
+                .font(.subheadline)
+            Spacer()
+            Menu {
+                Button(Strings.autoToggleNever) { onSet(nil) }
+                ForEach(Self.options, id: \.seconds) { opt in
+                    Button(opt.label) { onSet(opt.seconds) }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(currentLabel).font(.subheadline.monospacedDigit())
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                }
+                .foregroundStyle(.accent)
+            }
+        }
+        .onReceive(ticker) { t in
+            // Only advance the clock while a timer is active to avoid needless redraws.
+            if user.sharingAutoToggleAt != nil { now = t }
+        }
+    }
+
+    /// `H:MM:SS` when ≥1 hour remains, else `MM:SS`. Matches Android's formatter.
+    static func formatCountdown(_ remaining: TimeInterval) -> String {
+        let total = max(0, Int(remaining))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 }
 
