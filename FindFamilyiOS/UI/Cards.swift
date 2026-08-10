@@ -198,15 +198,10 @@ struct TemporaryLinkCard: View {
             }
             Spacer()
             Button {
-                // PQC routing: include PQC private bundle fragment when available.
-                // Fragment never hits server; classic #key= still present for backward compat.
-                let base = "https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#key=\(link.key)"
-                let url = if let pqcPriv = link.pqcKey {
-                    "\(base)&pqc_key=\(pqcPriv)"
-                } else {
-                    base
-                }
-                Platform.copy(url)
+                // Links are post-quantum only, matching Android: the fragment carries just
+                // the PQC private bundle — no classic `#key=`. The fragment never hits the server.
+                guard let pqcKey = link.pqcKey else { return }
+                Platform.copy("https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#pqc_key=\(pqcKey)")
             } label: { Image(systemName: "doc.on.doc") }
             Button(role: .destructive) {
                 Database.shared.deleteTemporaryLink(link)
