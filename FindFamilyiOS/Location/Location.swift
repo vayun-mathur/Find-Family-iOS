@@ -244,30 +244,35 @@ final class BackgroundTask {
 
     private func updateUserLocationName(_ loc: LocationValue) async {
         guard var user = Database.shared.user(id: loc.userid) else { return }
-        var newName = user.locationName
+        // Recompute the display name on every incoming fix: prefer a matching waypoint,
+        // otherwise reverse-geocode the fresh coordinate. This mirrors the local "Me"
+        // handling above and Android's heartbeat. Previously the geocode only ran while
+        // the stored name was still "Unnamed Location", so once a peer had any real name
+        // it never refreshed and the main-page list showed a location stuck for weeks.
+        var newName: String?
         for wp in Database.shared.waypointsSubject.value {
             if haversine(loc.coord, wp.coord) < wp.range { newName = wp.name; break }
         }
-        if newName == user.locationName, newName == "Unnamed Location" {
-            // Reverse geocode for a friendly fallback.
-            if let placemarks = try? await geocoder.reverseGeocodeLocation(
-                CLLocation(latitude: loc.coord.lat, longitude: loc.coord.lon)
-            ), let p = placemarks.first {
-                newName = [p.name, p.locality].compactMap { $0 }.first ?? "Unnamed Location"
-            }
+        if newName == nil,
+           let placemarks = try? await geocoder.reverseGeocodeLocation(
+               CLLocation(latitude: loc.coord.lat, longitude: loc.coord.lon)
+           ), let p = placemarks.first {
+            newName = [p.name, p.locality].compactMap { $0 }.first
         }
-        if newName != user.locationName {
-            user.locationName = newName
+        // If we couldn't resolve a fresh name, keep the existing one rather than clobbering it.
+        let resolved = newName ?? user.locationName
+        if resolved != user.locationName {
+            user.locationName = resolved
             user.lastLocationChangeTime = Date()
             Database.shared.upsertUser(user)
-            if let prev = lastUserLocationName[user.id], prev != newName {
+            if let prev = lastUserLocationName[user.id], prev != resolved {
                 NotificationsUtil.send(
                     title: Strings.notifWaypointEnterTitle,
-                    body: Strings.notifWaypointEnterBody(user.name, newName),
+                    body: Strings.notifWaypointEnterBody(user.name, resolved),
                     category: "WAYPOINT_ENTER_EXIT"
                 )
             }
-            lastUserLocationName[user.id] = newName
+            lastUserLocationName[user.id] = resolved
         }
     }
 
