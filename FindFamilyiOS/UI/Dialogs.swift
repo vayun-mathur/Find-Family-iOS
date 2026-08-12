@@ -10,6 +10,7 @@ struct AddPersonDialog: View {
     @State private var contactName: String?
     @State private var contactPhoto: String?
     @State private var justCopied = false
+    @State private var showNeedsUpdate = false
 
     private var myIDStr: String { Base26.encode(Networking.shared.userid) }
 
@@ -123,26 +124,42 @@ struct AddPersonDialog: View {
                     Button(Strings.cancelButton) { isPresented = false }
                 }
             }
+            .alert(Strings.outdatedPeerTitle, isPresented: $showNeedsUpdate) {
+                Button(Strings.okButton, role: .cancel) {}
+            } message: {
+                Text(Strings.outdatedPeerMessage)
+            }
         }
     }
 
     private func submit() {
         guard let id = theirID, let name = contactName else { return }
-        let isAccepting = (status == .awaitingRequest)
-        let newStatus: RequestStatus = isAccepting ? .mutualConnection : .awaitingResponse
-        let user = User(
-            id: id,
-            name: name,
-            photo: contactPhoto,
-            locationName: "Unknown Location",
-            sendingEnabled: true,
-            requestStatus: newStatus,
-            lastLocationChangeTime: Date(),
-            encryptionKey: nil,
-            pqcEncryptionKey: nil
-        )
-        Database.shared.upsertUser(user)
-        isPresented = false
+        // Check the peer's post-quantum capability "when connecting". FindFamily is PQC-only, so a
+        // peer who registered only a classic key is on an outdated app: prompt them to update
+        // instead of adding them. Unknown (not-yet-registered) peers are allowed through — they may
+        // register with PQC once they install the app.
+        Task { @MainActor in
+            let peerStatus = await Networking.shared.peerCryptoStatus(forUserid: id)
+            if peerStatus == .needsUpdate {
+                showNeedsUpdate = true
+                return
+            }
+            let isAccepting = (status == .awaitingRequest)
+            let newStatus: RequestStatus = isAccepting ? .mutualConnection : .awaitingResponse
+            let user = User(
+                id: id,
+                name: name,
+                photo: contactPhoto,
+                locationName: "Unknown Location",
+                sendingEnabled: true,
+                requestStatus: newStatus,
+                lastLocationChangeTime: Date(),
+                encryptionKey: nil,
+                pqcEncryptionKey: nil
+            )
+            Database.shared.upsertUser(user)
+            isPresented = false
+        }
     }
 
     private func copyMyID() {
@@ -263,21 +280,9 @@ struct AddLinkDialog: View {
         working = true
         Task {
             do {
-                let (priv, pub) = try RSAKeyManager.shared.generateEphemeralKeyPair()
-                let priPEM = try RSAPEM.privateKeyToPEM(priv)
-                let pubPEM = try RSAPEM.publicKeyToPEM(pub)
-                let priB64 = Data(priPEM.utf8).base64EncodedString()
-                let pubB64 = Data(pubPEM.utf8).base64EncodedString()
-                // PQC ephemeral — best effort, RSA still works if native not linked.
-                var pqcPublicB64: String? = nil
-                var pqcPrivateB64: String? = nil
-                do {
-                    let ep = try PQCKeyManager.shared.generateEphemeralBundle()
-                    pqcPublicB64 = ep.publicB64
-                    pqcPrivateB64 = ep.privateB64
-                } catch {
-                    print("AddLink: PQC ephemeral unavailable (native not linked?): \(error.localizedDescription)")
-                }
+                // Links are post-quantum only: generate a PQC ephemeral bundle. There is no RSA
+                // fallback, so this fails the creation rather than downgrading to classic crypto.
+                let ep = try PQCKeyManager.shared.generateEphemeralBundle()
                 let link = TemporaryLink(
                     // A link id is the server-side recipient id (what `/view/<id>` resolves to)
                     // and shares the random 64-bit namespace of userids. Room-style autoincrement
@@ -286,15 +291,15 @@ struct AddLinkDialog: View {
                     // newTemporaryLinkId()); this routes through the explicit-id INSERT OR REPLACE.
                     id: Int64.random(in: 1...Int64.max),
                     name: name.trimmingCharacters(in: .whitespaces),
-                    key: priB64,
-                    publicKey: pubB64,
+                    key: "",
+                    publicKey: "",
                     deleteAt: Date().addingTimeInterval(expirySeconds),
-                    pqcPublicKey: pqcPublicB64,
-                    pqcKey: pqcPrivateB64
+                    pqcPublicKey: ep.publicB64,
+                    pqcKey: ep.privateB64
                 )
                 _ = Database.shared.upsertTemporaryLink(link)
             } catch {
-                print("AddLink error: \(error)")
+                print("AddLink: PQC ephemeral unavailable (native not linked?): \(error.localizedDescription)")
             }
             working = false
             isPresented = false

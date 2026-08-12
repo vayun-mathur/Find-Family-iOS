@@ -130,6 +130,10 @@ enum Strings {
     // PQC broken-lock info box (shown when tapping red lock for non-PQC peers)
     static let pqcUnprotectedTitle = "Quantum protection"
     static let pqcUnprotectedMessage = "Unprotected against quantum computers: this person needs to update their app."
+
+    // Shown when connecting to a peer whose app is too old for post-quantum encryption.
+    static let outdatedPeerTitle = "Update needed"
+    static let outdatedPeerMessage = "This person is using an older version of FindFamily that doesn't support quantum-safe encryption. Ask them to update their app, then try connecting again."
 }
 
 // MARK: - Time formatting
