@@ -280,9 +280,9 @@ struct AddLinkDialog: View {
         working = true
         Task {
             do {
-                // Links are post-quantum only: generate a PQC ephemeral bundle. There is no RSA
+                // Links are post-quantum only: generate an ML-KEM link key. There is no RSA
                 // fallback, so this fails the creation rather than downgrading to classic crypto.
-                let ep = try PQCKeyManager.shared.generateEphemeralBundle()
+                let linkKey = try PQCKeyManager.shared.generateLinkKey()
                 let link = TemporaryLink(
                     // A link id is the server-side recipient id (what `/view/<id>` resolves to)
                     // and shares the random 64-bit namespace of userids. Room-style autoincrement
@@ -294,12 +294,13 @@ struct AddLinkDialog: View {
                     key: "",
                     publicKey: "",
                     deleteAt: Date().addingTimeInterval(expirySeconds),
-                    pqcPublicKey: ep.publicB64,
-                    pqcKey: ep.privateB64
+                    pqcPublicKey: linkKey.publicB64,
+                    pqcKey: nil,
+                    pqcSeed: linkKey.seedB64Url
                 )
                 _ = Database.shared.upsertTemporaryLink(link)
             } catch {
-                print("AddLink: PQC ephemeral unavailable (native not linked?): \(error.localizedDescription)")
+                print("AddLink: PQC link key unavailable (native not linked?): \(error.localizedDescription)")
             }
             working = false
             isPresented = false

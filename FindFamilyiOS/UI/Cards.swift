@@ -198,10 +198,14 @@ struct TemporaryLinkCard: View {
             }
             Spacer()
             Button {
-                // Links are post-quantum only, matching Android: the fragment carries just
-                // the PQC private bundle — no classic `#key=`. The fragment never hits the server.
-                guard let pqcKey = link.pqcKey else { return }
-                Platform.copy("https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#pqc_key=\(pqcKey)")
+                // The fragment carries the link's secret and never hits the server. New links
+                // send just the 32-byte ML-KEM seed (`#s=`) with a Base26 id, which fits in an
+                // SMS; links minted before that still carry their full private bundle.
+                if let seed = link.pqcSeed {
+                    Platform.copy("https://findfamily.cc/view/\(Base26.encode(link.id))#s=\(seed)")
+                } else if let pqcKey = link.pqcKey {
+                    Platform.copy("https://findfamily.cc/view/\(UInt64(bitPattern: link.id))#pqc_key=\(pqcKey)")
+                }
             } label: { Image(systemName: "doc.on.doc") }
             Button(role: .destructive) {
                 Database.shared.deleteTemporaryLink(link)

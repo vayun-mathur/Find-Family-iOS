@@ -2,7 +2,8 @@
 //
 // Purpose: allows the iOS app to build and link even when libe2ee_pqc.a XCFramework
 // is not present. Each function returns failure (0) / no-op, so PQC is reported as
-// unavailable and Networking falls back to RSA-only — no crash, no link error.
+// unavailable — no crash, no link error. There is no classic fallback: sharing simply
+// does not work until the real library is linked.
 //
 // When the real Rust lib (src/main/rust) is built for iOS and added as
 // e2ee_pqc.xcframework (static lib), its strong symbols override these weak ones
@@ -51,6 +52,22 @@ __attribute__((weak)) int32_t pqc_identity_keygen(
     uint8_t **priv_bundle_out, size_t *priv_bundle_len_out) {
     (void)pub_bundle_out; (void)pub_bundle_len_out;
     (void)priv_bundle_out; (void)priv_bundle_len_out;
+    return 0;
+}
+
+__attribute__((weak)) int32_t pqc_link_keygen(
+    uint8_t **seed_out, size_t *seed_len_out,
+    uint8_t **pub_bundle_out, size_t *pub_bundle_len_out) {
+    (void)seed_out; (void)seed_len_out;
+    (void)pub_bundle_out; (void)pub_bundle_len_out;
+    return 0;
+}
+
+__attribute__((weak)) int32_t pqc_link_pub_from_seed(
+    const uint8_t *seed, size_t seed_len,
+    uint8_t **pub_bundle_out, size_t *pub_bundle_len_out) {
+    (void)seed; (void)seed_len;
+    (void)pub_bundle_out; (void)pub_bundle_len_out;
     return 0;
 }
 

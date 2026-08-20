@@ -162,6 +162,10 @@ struct TemporaryLink: Identifiable, Codable, Hashable, Equatable {
     var deleteAt: Date
     /// PQC ephemeral public bundle (base64 [4B kemLen][kemPub][dsaPub]), nullable for migration.
     var pqcPublicKey: String? = nil
-    /// PQC ephemeral private bundle (base64 [4B kemPrivLen][kemPriv][dsaPriv]), nullable. Fragment `#pqc_key=` contains this.
+    /// Legacy: the full PQC private bundle (base64 [4B kemPrivLen][kemPriv][dsaPriv]) that older
+    /// builds put in the fragment as `#pqc_key=`. Only set on links created before [pqcSeed].
     var pqcKey: String? = nil
+    /// The 32-byte ML-KEM link seed (base64url, unpadded) — what goes in the fragment as `#s=`.
+    /// This is the link's entire secret; the recipient's browser expands it into the keypair.
+    var pqcSeed: String? = nil
 }

@@ -169,6 +169,21 @@ func pqc_identity_keygen(
     _ priv_bundle_len_out: UnsafeMutablePointer<Int>
 ) -> Int32
 
+@_silgen_name("pqc_link_keygen")
+func pqc_link_keygen(
+    _ seed_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
+    _ seed_len_out: UnsafeMutablePointer<Int>,
+    _ pub_bundle_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
+    _ pub_bundle_len_out: UnsafeMutablePointer<Int>
+) -> Int32
+
+@_silgen_name("pqc_link_pub_from_seed")
+func pqc_link_pub_from_seed(
+    _ seed: UnsafePointer<UInt8>?, _ seed_len: Int,
+    _ pub_bundle_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
+    _ pub_bundle_len_out: UnsafeMutablePointer<Int>
+) -> Int32
+
 @_silgen_name("pqc_kem_encaps")
 func pqc_kem_encaps(
     _ kem_pub: UnsafePointer<UInt8>?, _ kem_pub_len: Int,
@@ -310,5 +325,42 @@ enum PQCCrypto {
         pqc_secure_zero(pr, privLen)
         pqc_free(pr, privLen)
         return (pubData, privData)
+    }
+
+    /// Generates a share-link key: a 32-byte ML-KEM seed plus the ML-KEM-only public bundle
+    /// it derives. The seed is the link's whole secret — it is what goes in the URL fragment,
+    /// and the recipient's browser expands it back into the keypair.
+    static func generateLinkKey() throws -> (seed: Data, publicBundle: Data) {
+        var seedPtr: UnsafeMutablePointer<UInt8>? = nil
+        var seedLen: Int = 0
+        var pubPtr: UnsafeMutablePointer<UInt8>? = nil
+        var pubLen: Int = 0
+        let ok = pqc_link_keygen(&seedPtr, &seedLen, &pubPtr, &pubLen)
+        guard ok == 1, let sp = seedPtr, let pb = pubPtr else {
+            throw NSError(domain: "pqc", code: -7, userInfo: [NSLocalizedDescriptionKey: "link keygen failed (native not linked?)"])
+        }
+        defer {
+            pqc_secure_zero(sp, seedLen)
+            pqc_free(sp, seedLen)
+            pqc_free(pb, pubLen)
+        }
+        return (Data(bytes: sp, count: seedLen), Data(bytes: pb, count: pubLen))
+    }
+
+    /// Re-derives a share-link public bundle from a stored 32-byte seed.
+    static func linkPublicFromSeed(_ seed: Data) throws -> Data {
+        var pubPtr: UnsafeMutablePointer<UInt8>? = nil
+        var pubLen: Int = 0
+        let ok: Int32 = seed.withUnsafeBytes { seedBuf in
+            pqc_link_pub_from_seed(
+                seedBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), seedBuf.count,
+                &pubPtr, &pubLen
+            )
+        }
+        guard ok == 1, let pb = pubPtr else {
+            throw NSError(domain: "pqc", code: -8, userInfo: [NSLocalizedDescriptionKey: "link key derivation failed"])
+        }
+        defer { pqc_free(pb, pubLen) }
+        return Data(bytes: pb, count: pubLen)
     }
 }

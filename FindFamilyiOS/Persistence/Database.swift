@@ -109,6 +109,9 @@ final class Database {
         if !columnExists(table: "temporaryLinks", column: "pqcKey") {
             exec("ALTER TABLE temporaryLinks ADD COLUMN pqcKey TEXT;")
         }
+        if !columnExists(table: "temporaryLinks", column: "pqcSeed") {
+            exec("ALTER TABLE temporaryLinks ADD COLUMN pqcSeed TEXT;")
+        }
     }
 
     // MARK: - Reload helpers
@@ -462,7 +465,7 @@ final class Database {
         var result = link
         queue.sync {
             if link.id == 0 {
-                let sql = "INSERT INTO temporaryLinks (name, key, publicKey, deleteAt, pqcPublicKey, pqcKey) VALUES (?, ?, ?, ?, ?, ?);"
+                let sql = "INSERT INTO temporaryLinks (name, key, publicKey, deleteAt, pqcPublicKey, pqcKey, pqcSeed) VALUES (?, ?, ?, ?, ?, ?, ?);"
                 var stmt: OpaquePointer?
                 sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
                 bindText(stmt, 1, link.name)
@@ -471,11 +474,12 @@ final class Database {
                 sqlite3_bind_int64(stmt, 4, Int64(link.deleteAt.timeIntervalSince1970))
                 bindOptionalText(stmt, 5, link.pqcPublicKey)
                 bindOptionalText(stmt, 6, link.pqcKey)
+                bindOptionalText(stmt, 7, link.pqcSeed)
                 sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
                 result.id = sqlite3_last_insert_rowid(db)
             } else {
-                let sql = "INSERT OR REPLACE INTO temporaryLinks (id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey) VALUES (?, ?, ?, ?, ?, ?, ?);"
+                let sql = "INSERT OR REPLACE INTO temporaryLinks (id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey, pqcSeed) VALUES (?, ?, ?, ?, ?, ?, ?, ?);"
                 var stmt: OpaquePointer?
                 sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
                 sqlite3_bind_int64(stmt, 1, link.id)
@@ -485,6 +489,7 @@ final class Database {
                 sqlite3_bind_int64(stmt, 5, Int64(link.deleteAt.timeIntervalSince1970))
                 bindOptionalText(stmt, 6, link.pqcPublicKey)
                 bindOptionalText(stmt, 7, link.pqcKey)
+                bindOptionalText(stmt, 8, link.pqcSeed)
                 sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
@@ -503,7 +508,7 @@ final class Database {
     private func loadTemporaryLinks() -> [TemporaryLink] {
         var out: [TemporaryLink] = []
         // Try new schema first; fallback to old if column missing.
-        let sql = "SELECT id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey FROM temporaryLinks;"
+        let sql = "SELECT id, name, key, publicKey, deleteAt, pqcPublicKey, pqcKey, pqcSeed FROM temporaryLinks;"
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
@@ -518,7 +523,8 @@ final class Database {
                     publicKey: text(stmt, 3) ?? "",
                     deleteAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 4))),
                     pqcPublicKey: nil,
-                    pqcKey: nil
+                    pqcKey: nil,
+                    pqcSeed: nil
                 ))
             }
             sqlite3_finalize(stmt)
@@ -532,7 +538,8 @@ final class Database {
                 publicKey: text(stmt, 3) ?? "",
                 deleteAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 4))),
                 pqcPublicKey: text(stmt, 5),
-                pqcKey: text(stmt, 6)
+                pqcKey: text(stmt, 6),
+                pqcSeed: text(stmt, 7)
             ))
         }
         sqlite3_finalize(stmt)

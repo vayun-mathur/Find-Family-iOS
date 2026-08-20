@@ -142,13 +142,18 @@ final class PQCKeyManager {
         try identity().publicBundle.base64EncodedString()
     }
 
-    // MARK: - Ephemeral (TemporaryLink)
+    // MARK: - Share links (TemporaryLink)
 
-    /// Generate a fresh ephemeral PQC bundle for a TemporaryLink, same crypto as device identity.
-    /// Returns (publicBundleB64, privateBundleB64).
-    func generateEphemeralBundle() throws -> (publicB64: String, privateB64: String) {
-        let (pubBundle, privBundle) = try PQCCrypto.generateIdentity()
-        return (pubBundle.base64EncodedString(), privBundle.base64EncodedString())
+    /// Generate a fresh share-link key. The link is ML-KEM only and derived from a 32-byte
+    /// seed; the seed (base64url, unpadded) is what goes in the URL fragment, and the public
+    /// bundle is what locations get encrypted to.
+    func generateLinkKey() throws -> (seedB64Url: String, publicB64: String) {
+        let (seed, pubBundle) = try PQCCrypto.generateLinkKey()
+        let seedB64Url = seed.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return (seedB64Url, pubBundle.base64EncodedString())
     }
 
     // MARK: - Encrypt / Decrypt helpers (mirror Pqc.encryptTo / decrypt)
