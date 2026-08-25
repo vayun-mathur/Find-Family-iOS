@@ -134,6 +134,10 @@ enum Strings {
     // Shown when connecting to a peer whose app is too old for post-quantum encryption.
     static let outdatedPeerTitle = "Update needed"
     static let outdatedPeerMessage = "This person is using an older version of FindFamily that doesn't support quantum-safe encryption. Ask them to update their app, then try connecting again."
+
+    // Shown when a peer's key doesn't match the fingerprint their invite link vouched for.
+    static let keyMismatchTitle = "Couldn't verify this person"
+    static let keyMismatchMessage = "The encryption key for this person doesn't match the one their invite link listed, so they weren't added. Check that you opened the whole link, and ask them to send a new one."
 }
 
 // MARK: - Time formatting
@@ -202,15 +206,23 @@ enum NotificationsUtil {
 
 // MARK: - Deep links
 
-/// Routes incoming `findfamily://add/<base26>` invites to the UI. The link carries
-/// only the sender's public id — never a key — so prefilling the Add Person dialog
-/// from it is safe; the user still explicitly accepts.
+/// A tapped invite link: the sender's id, plus the bundle fingerprint it vouched for.
+struct AddInvite: Equatable {
+    let id: Int64
+    /// The `k=` value, or nil for links from builds before it existed.
+    let fingerprint: String?
+}
+
+/// Routes incoming `findfamily://add/<base26>[?k=<fingerprint>]` invites to the UI. The
+/// link carries the sender's public id and a hash of their public key — never a key and
+/// never a secret — so prefilling the Add Person dialog from it is safe; the user still
+/// explicitly accepts, and the fingerprint is checked against the relay's key on connect.
 final class DeepLinkRouter: ObservableObject {
     static let shared = DeepLinkRouter()
     private init() {}
 
-    /// Decoded invite user id awaiting presentation, or nil once consumed.
-    @Published var pendingAddId: Int64?
+    /// Decoded invite awaiting presentation, or nil once consumed.
+    @Published var pendingAddInvite: AddInvite?
 
     func handle(_ url: URL) {
         guard url.scheme == "findfamily", url.host == "add" else { return }
@@ -220,7 +232,19 @@ final class DeepLinkRouter: ObservableObject {
         guard !segment.isEmpty,
               segment.allSatisfy({ $0.isASCII && $0.isLetter }),
               let id = Base26.decode(segment) else { return }
-        pendingAddId = id
+        pendingAddInvite = AddInvite(id: id, fingerprint: Self.fingerprint(from: url))
+    }
+
+    /// The `k` query value, accepted only if it looks like base64url. Anything else is
+    /// dropped, which leaves the invite unverified rather than failing the whole link.
+    private static func fingerprint(from url: URL) -> String? {
+        guard let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "k" })?.value?
+            .trimmingCharacters(in: .whitespaces), !value.isEmpty else { return nil }
+        let isBase64url = value.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
+        }
+        return isBase64url ? value : nil
     }
 }
 

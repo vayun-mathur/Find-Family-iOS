@@ -4,6 +4,8 @@ import SwiftUI
 
 struct AddPersonDialog: View {
     let presetID: Int64?
+    /// The `k=` fingerprint from the invite link that prefilled `presetID`, if any.
+    let fingerprint: String?
     @Binding var isPresented: Bool
 
     @State private var theirIDStr: String = ""
@@ -11,6 +13,7 @@ struct AddPersonDialog: View {
     @State private var contactPhoto: String?
     @State private var justCopied = false
     @State private var showNeedsUpdate = false
+    @State private var showKeyMismatch = false
 
     private var myIDStr: String { Base26.encode(Networking.shared.userid) }
 
@@ -71,11 +74,12 @@ struct AddPersonDialog: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    // Share sheet instead of copy/paste: sends findfamily://add/<myId>,
-                    // which prefills the recipient's Add Person dialog. The link carries
-                    // only a public id — never a key — so it's safe to share anywhere.
+                    // Share sheet instead of copy/paste: sends an https link that bounces
+                    // to findfamily://add/<myId>?k=<fingerprint>, which prefills the
+                    // recipient's Add Person dialog. See Networking.inviteLink() for why
+                    // the web hop exists and what `k` is.
                     Button {
-                        Platform.share("findfamily://add/\(myIDStr)")
+                        Platform.share(Networking.shared.inviteLink())
                     } label: {
                         HStack {
                             Image(systemName: "square.and.arrow.up")
@@ -129,6 +133,11 @@ struct AddPersonDialog: View {
             } message: {
                 Text(Strings.outdatedPeerMessage)
             }
+            .alert(Strings.keyMismatchTitle, isPresented: $showKeyMismatch) {
+                Button(Strings.okButton, role: .cancel) {}
+            } message: {
+                Text(Strings.keyMismatchMessage)
+            }
         }
     }
 
@@ -138,10 +147,21 @@ struct AddPersonDialog: View {
         // peer who registered only a classic key is on an outdated app: prompt them to update
         // instead of adding them. Unknown (not-yet-registered) peers are allowed through — they may
         // register with PQC once they install the app.
+        //
+        // The fingerprint only vouches for the id that arrived in the link, and the field is
+        // read-only whenever there is a preset, so it applies exactly when one is present.
+        let inviteFingerprint = presetID != nil ? fingerprint : nil
         Task { @MainActor in
-            let peerStatus = await Networking.shared.peerCryptoStatus(forUserid: id)
-            if peerStatus == .needsUpdate {
+            let check = await Networking.shared.peerCryptoStatus(
+                forUserid: id,
+                expectedFingerprint: inviteFingerprint
+            )
+            if check.status == .needsUpdate {
                 showNeedsUpdate = true
+                return
+            }
+            if check.status == .keyMismatch {
+                showKeyMismatch = true
                 return
             }
             let isAccepting = (status == .awaitingRequest)
@@ -155,7 +175,9 @@ struct AddPersonDialog: View {
                 requestStatus: newStatus,
                 lastLocationChangeTime: Date(),
                 encryptionKey: nil,
-                pqcEncryptionKey: nil
+                // Store the fingerprint-checked key with the row itself, so the key that
+                // was verified is the one used from here on rather than a fresh lookup.
+                pqcEncryptionKey: check.verifiedBundleB64
             )
             Database.shared.upsertUser(user)
             isPresented = false

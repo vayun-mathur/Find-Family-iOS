@@ -51,6 +51,8 @@ struct MainView: View {
     // Dialogs
     @State private var showAddPersonDialog = false
     @State private var addPersonId: Int64?
+    /// Fingerprint from the invite link that set `addPersonId`, when it came from one.
+    @State private var addPersonFingerprint: String?
     @State private var showAddLinkDialog = false
     @State private var showMissingFeaturesDialog = false
     @State private var showSecurityCode = false
@@ -111,8 +113,15 @@ struct MainView: View {
             .navigationTitle(Text(headerTitle))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { topBarToolbar }
-            .sheet(isPresented: $showAddPersonDialog, onDismiss: { addPersonId = nil }) {
-                AddPersonDialog(presetID: addPersonId, isPresented: $showAddPersonDialog)
+            .sheet(isPresented: $showAddPersonDialog, onDismiss: {
+                addPersonId = nil
+                addPersonFingerprint = nil
+            }) {
+                AddPersonDialog(
+                    presetID: addPersonId,
+                    fingerprint: addPersonFingerprint,
+                    isPresented: $showAddPersonDialog
+                )
             }
             .sheet(isPresented: $showAddLinkDialog) {
                 AddLinkDialog(isPresented: $showAddLinkDialog)
@@ -145,10 +154,11 @@ struct MainView: View {
         }
         // A tapped findfamily://add/<id> invite prefills the Add Person dialog. @Published
         // replays its current value on subscribe, so this catches cold-start links too.
-        .onReceive(deepLink.$pendingAddId.compactMap { $0 }) { id in
-            addPersonId = id
+        .onReceive(deepLink.$pendingAddInvite.compactMap { $0 }) { invite in
+            addPersonId = invite.id
+            addPersonFingerprint = invite.fingerprint
             showAddPersonDialog = true
-            deepLink.pendingAddId = nil
+            deepLink.pendingAddInvite = nil
         }
     }
 
@@ -199,6 +209,7 @@ struct MainView: View {
             AddMenu(
                 onAddPerson: {
                     addPersonId = nil
+                    addPersonFingerprint = nil
                     showAddPersonDialog = true
                 },
                 onAddWaypoint: {
@@ -287,7 +298,10 @@ struct MainView: View {
                             waypointCoord = wp.coord
                         },
                         onTapRequest: { id in
+                            // An inbound sharing request, not an invite link, so there is
+                            // no fingerprint to check against.
                             addPersonId = id
+                            addPersonFingerprint = nil
                             showAddPersonDialog = true
                         }
                     )

@@ -140,46 +140,65 @@ final class Networking: ObservableObject {
         return await registerPqc()
     }
 
-    /// Whether the server holds a *classic* (RSA) key for [id]. Used only to detect peers on an
-    /// outdated, pre-quantum app — FindFamily never encrypts with RSA anymore.
-    func hasClassicKey(forUserid id: Int64) async -> Bool {
-        let body = Data(#"{"userid": \#(UInt64(bitPattern: id))}"#.utf8)
-        do {
-            let (data, http) = try await client.postJSON(path: "/api/getkey", jsonBody: body)
-            networkIsDown = false
-            return http.statusCode == 200 && !data.isEmpty
-        } catch {
-            checkNetworkDown(error)
-            return false
-        }
-    }
-
-    /// Whether the server holds a *PQC* bundle for [id] (independent of this device's PQC
-    /// availability, unlike [getPqcKeyRaw]). Used for peer-capability detection.
-    private func serverHasPqcKey(forUserid id: Int64) async -> Bool {
-        let body = Data(#"{"userid": \#(UInt64(bitPattern: id))}"#.utf8)
-        do {
-            let (data, http) = try await client.postJSON(path: "/api/pqc/getkey", jsonBody: body)
-            networkIsDown = false
-            return http.statusCode == 200 && !data.isEmpty
-        } catch {
-            checkNetworkDown(error)
-            return false
-        }
-    }
-
     /// Post-quantum capability of a peer, used to gate connecting/sharing.
     enum PeerCrypto {
         case pqc          // peer has a PQC bundle — sharing works
         case needsUpdate  // peer has only a classic key — outdated app, must update
         case unknown      // not registered, or the lookup failed (offline)
+        case keyMismatch  // the relay's bundle doesn't match the invite link's fingerprint
     }
 
-    /// Checks a peer's PQC capability "when connecting": a PQC bundle present → `.pqc`; only a
-    /// classic key → `.needsUpdate` (show the update prompt); neither → `.unknown`.
-    func peerCryptoStatus(forUserid id: Int64) async -> PeerCrypto {
-        if await serverHasPqcKey(forUserid: id) { return .pqc }
-        return await hasClassicKey(forUserid: id) ? .needsUpdate : .unknown
+    /// Outcome of the connect-time key check. `verifiedBundleB64` is set only when an
+    /// invite fingerprint was supplied and matched, and is meant to go straight onto the
+    /// `User` row being created — pinning the key that was checked, so `resolvedPqcBundle`
+    /// prefers it and a later lookup can't swap in one the fingerprint never covered.
+    struct PeerKeyCheck {
+        let status: PeerCrypto
+        let verifiedBundleB64: String?
+    }
+
+    /// Checks a peer's PQC capability "when connecting", over the relay socket. A PQC
+    /// bundle → `.pqc`; only a classic key → `.needsUpdate` (show the update prompt);
+    /// neither, or the lookup failed → `.unknown`.
+    ///
+    /// `expectedFingerprint` is the `k=` value of the invite link this came from, when
+    /// there was one. The relay's bundle has to hash to it, or the result is
+    /// `.keyMismatch` — this is what stops the relay handing out a key it controls
+    /// instead of the sender's.
+    func peerCryptoStatus(forUserid id: Int64, expectedFingerprint: String? = nil) async -> PeerKeyCheck {
+        guard let res = await RelayKeyLookup.getKey(userId: id) else {
+            return PeerKeyCheck(status: .unknown, verifiedBundleB64: nil)
+        }
+        switch res.status {
+        case .pqc:
+            guard let expected = expectedFingerprint else {
+                return PeerKeyCheck(status: .pqc, verifiedBundleB64: nil)
+            }
+            guard let bundle = res.bundle, !bundle.isEmpty else {
+                return PeerKeyCheck(status: .unknown, verifiedBundleB64: nil)
+            }
+            guard InviteFingerprint.matches(userId: id, publicBundle: bundle, expected: expected) else {
+                print("Networking: invite fingerprint mismatch for \(UInt64(bitPattern: id))")
+                return PeerKeyCheck(status: .keyMismatch, verifiedBundleB64: nil)
+            }
+            return PeerKeyCheck(status: .pqc, verifiedBundleB64: bundle.base64EncodedString())
+        case .classic:
+            return PeerKeyCheck(status: .needsUpdate, verifiedBundleB64: nil)
+        case .noKey:
+            return PeerKeyCheck(status: .unknown, verifiedBundleB64: nil)
+        }
+    }
+
+    /// The invite link to share: the https bounce page, which many messaging apps will
+    /// linkify where a bare `findfamily://` URI is left as plain text. Both values ride in
+    /// the fragment, which browsers never send, so the server sees only that some share
+    /// page was opened. `k` is a 22-character hash of our public bundle, not the bundle
+    /// itself (~4 kB base64) — the recipient fetches the key from the relay and checks it
+    /// against this. Omitted when PQC is unavailable, leaving the id-only link.
+    func inviteLink() -> String {
+        let base = "https://ma.vayunmathur.com/ff/share#id=\(Base26.encode(userid))"
+        guard let bundle = pqcIdentity?.publicBundle else { return base }
+        return base + "&k=" + InviteFingerprint.encode(userId: userid, publicBundle: bundle)
     }
 
     /// Computes the quantum-safe verification "security code" (safety number) for a connection:
@@ -219,8 +238,11 @@ final class Networking: ObservableObject {
     func getPqcBundle(forUserid id: Int64) async -> Data? {
         guard pqcAvailable else { return nil }
         if let data = await getPqcKeyRaw(forUserid: id) {
-            // Cache atomically so we don't clobber other columns (sharingAutoToggleAt etc.).
-            if let u = Database.shared.user(id: id), u.pqcEncryptionKey == nil {
+            // Overwrite rather than fill-only-if-empty, matching Android: this is only
+            // reached when there was no cached bundle to prefer, and a stale value here
+            // would keep us encrypting to a key the peer has already replaced. Written on
+            // its own so the other columns (sharingAutoToggleAt etc.) aren't clobbered.
+            if Database.shared.user(id: id) != nil {
                 Database.shared.setPqcEncryptionKey(id: id, pqcEncryptionKey: data.base64EncodedString())
             }
             return data

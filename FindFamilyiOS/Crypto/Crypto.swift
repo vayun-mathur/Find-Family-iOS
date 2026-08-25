@@ -129,3 +129,70 @@ extension Int64 {
     /// Convenience: `myId.base26`.
     var base26: String { Base26.encode(self) }
 }
+
+// MARK: - Invite fingerprint
+
+/// Short fingerprint of a public bundle, small enough to ride in an invite link.
+/// Byte-identical to Kotlin `InviteFingerprint`.
+///
+/// A PQC bundle is ~3.1 kB, so the key itself cannot travel in a URL. An invite carries
+/// this truncated digest instead; the recipient still fetches the full bundle from the
+/// relay and checks that it hashes to what the link said, which removes the relay's
+/// ability to substitute a key of its own. The user id is hashed in so a fingerprint
+/// lifted from one invite cannot be presented as another user's.
+///
+/// Cross-platform test vectors, asserted on the Android side in `InviteFingerprintTest`
+/// (`matches_the_cross_platform_test_vector`). With `publicBundle` = 3184 bytes where
+/// byte *i* is `i % 256`:
+///
+///     userId  12345  ->  "iXVzYL2J4imtjXPgh-dmtw"
+///     userId     -2  ->  "rjnCvl7blekCiZv2q9QJOA"
+///
+/// A link minted on one platform has to verify on the other, so changing the domain
+/// string, the id width, or `length` here breaks live invites in both directions.
+enum InviteFingerprint {
+    /// Truncated digest length. 16 bytes encodes to 22 unpadded base64url characters.
+    static let length = 16
+
+    private static let domain = "ff-invite-v1"
+
+    /// `SHA-256(domain || u64be(userId) || publicBundle)`, truncated to `length`.
+    static func compute(userId: Int64, publicBundle: Data) -> Data {
+        var input = Data(domain.utf8)
+        // Big-endian over the *bit pattern*, so a negative id hashes to the same bytes
+        // the Kotlin side produces for the matching ULong.
+        withUnsafeBytes(of: UInt64(bitPattern: userId).bigEndian) { input.append(contentsOf: $0) }
+        input.append(publicBundle)
+        return Data(SecurityCodeFormat.sha256(input).prefix(length))
+    }
+
+    /// The `k=` value of a share link: unpadded base64url.
+    static func encode(userId: Int64, publicBundle: Data) -> String {
+        base64urlEncode(compute(userId: userId, publicBundle: publicBundle))
+    }
+
+    /// Whether `publicBundle` is the one `expected` (unpadded base64url) names. A
+    /// malformed or truncated value fails rather than being skipped, so a mangled link
+    /// counts as unverified instead of silently trusting whatever the relay returned.
+    static func matches(userId: Int64, publicBundle: Data, expected: String) -> Bool {
+        guard let want = base64urlDecode(expected), want.count == length else { return false }
+        return want == compute(userId: userId, publicBundle: publicBundle)
+    }
+
+    static func base64urlEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    static func base64urlDecode(_ s: String) -> Data? {
+        var b64 = s
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        // Data(base64Encoded:) rejects unpadded input, and links carry it unpadded.
+        let remainder = b64.count % 4
+        if remainder != 0 { b64 += String(repeating: "=", count: 4 - remainder) }
+        return Data(base64Encoded: b64)
+    }
+}
