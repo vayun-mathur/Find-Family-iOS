@@ -39,9 +39,12 @@ final class NetworkClient {
 ///   - Device PQC identity uses `PQCKeyManager` which stores `ff_pqcKemPub/Priv`, `ff_pqcDsaPub/Priv`
 ///     (same as Android's `ff_pqc` prefix) in Keychain, with bundle format [4B kemLen][kemPub][dsaPub]
 ///     and sealed layout [4B encapLen][encap][aes] (aes = [12B iv][ct||tag]), KDF SHA256(BE32(1)||Z).
-///   - Server parallel endpoints `/api/pqc/*` store PQC bundles separately from RSA; publish/receive
-///     have `_pqc` variants. If peer has PQC key, publish ONLY to PQC endpoint (higher tier).
-///   - Receive drains both classic and PQC queues for backward compat during rollout.
+///   - Server parallel endpoints `/api/pqc/*` store PQC bundles separately from RSA.
+///
+/// This app is **post-quantum only**: it publishes to and receives from the `_pqc` endpoints
+/// exclusively and never touches the classic RSA location/UWB queues, and it registers only a
+/// PQC bundle. Android keeps its classic fallback for other peers, but it always prefers PQC
+/// when the peer has a bundle registered — which this app does on every launch.
 @MainActor
 final class Networking: ObservableObject {
     static let shared = Networking()
@@ -300,6 +303,9 @@ final class Networking: ObservableObject {
 
     // MARK: - Receive (post-quantum only)
 
+    /// Drains the post-quantum queue. The classic RSA queue is deliberately not read:
+    /// this app publishes and receives post-quantum only, so anything sitting in the
+    /// classic queue was sent by a peer that hasn't picked up our PQC key yet.
     func receiveLocations() async -> [LocationValue]? {
         return await receiveLocationsPqc()
     }

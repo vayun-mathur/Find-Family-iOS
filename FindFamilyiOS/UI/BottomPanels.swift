@@ -61,24 +61,9 @@ struct UserDetailPanel: View {
     let onToggleSending: (Bool) -> Void
     let onSetAutoToggle: (TimeInterval?) -> Void
 
-    @State private var showPqcInfo = false
-
     var body: some View {
         VStack(spacing: 12) {
             UserCard(user: user, latest: latest, showSupporting: true) {}
-            // PQC status banner for unprotected connections (also tappable via lock in card)
-            if user.id != Networking.shared.userid && user.pqcEncryptionKey == nil {
-                Button { showPqcInfo = true } label: {
-                    Label(Strings.pqcUnprotectedMessage, systemImage: "lock.open.trianglebadge.exclamationmark")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
-                        .background(Color.red.opacity(0.12))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                .buttonStyle(.plain)
-            }
             VStack(spacing: 8) {
                 HStack {
                     Text(Strings.shareYourLocation)
@@ -106,11 +91,6 @@ struct UserDetailPanel: View {
             .buttonStyle(.bordered)
         }
         .padding(.horizontal)
-        .alert(Strings.pqcUnprotectedTitle, isPresented: $showPqcInfo) {
-            Button(Strings.okButton, role: .cancel) {}
-        } message: {
-            Text(Strings.pqcUnprotectedMessage)
-        }
     }
 }
 
@@ -166,7 +146,7 @@ struct AutoToggleRow: View {
                     Text(currentLabel).font(.subheadline.monospacedDigit())
                     Image(systemName: "chevron.up.chevron.down").font(.caption2)
                 }
-                .foregroundStyle(.accent)
+                .foregroundStyle(Color.accentColor)
             }
         }
         .onReceive(ticker) { t in
