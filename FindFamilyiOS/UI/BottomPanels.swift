@@ -64,17 +64,21 @@ struct UserDetailPanel: View {
     var body: some View {
         VStack(spacing: 12) {
             UserCard(user: user, latest: latest, showSupporting: true) {}
-            VStack(spacing: 8) {
-                HStack {
-                    Text(Strings.shareYourLocation)
-                    Spacer()
-                    Toggle("", isOn: Binding(get: { user.sendingEnabled }, set: { onToggleSending($0) }))
-                        .labelsHidden()
+            // Sharing controls are hidden for your own entry: you can't "stop sharing
+            // with yourself" (mirrors Android PersonDetailSheet).
+            if user.id != Networking.shared.userid {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text(Strings.shareYourLocation)
+                        Spacer()
+                        Toggle("", isOn: Binding(get: { user.sendingEnabled }, set: { onToggleSending($0) }))
+                            .labelsHidden()
+                    }
+                    AutoToggleRow(user: user, onSet: onSetAutoToggle)
                 }
-                AutoToggleRow(user: user, onSet: onSetAutoToggle)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
 
             // Precision Finding entry — pushed onto the MainView's NavigationStack.
             NavigationLink(value: user) {
