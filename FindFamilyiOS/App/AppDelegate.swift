@@ -20,7 +20,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             // Kick off the network / identity layer.
             await Networking.shared.start()
             // Begin location updates — this is the iOS analog of LocationTrackingService on Android.
-            LocationsHandler.shared.startLocationUpdates()
+            // A `.location` relaunch with nothing shared stops itself (see #629 gating).
+            LocationsHandler.shared.startLocationUpdates(launchedFromLocationEvent: self.isLaunchedFromLocationEvent)
         }
         return true
     }
