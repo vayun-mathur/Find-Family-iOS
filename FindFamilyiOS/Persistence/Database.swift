@@ -16,6 +16,10 @@ final class Database {
     let temporaryLinksSubject = CurrentValueSubject<[TemporaryLink], Never>([])
     let locationValuesSubject = CurrentValueSubject<[LocationValue], Never>([])
     let latestLocationsSubject = CurrentValueSubject<[Int64: LocationValue], Never>([:])
+    let noShowAlertsSubject = CurrentValueSubject<[NoShowAlert], Never>([])
+    /// Persisted outbound-sharing master switch (Android `GLOBAL_SHARING_ENABLED_KEY`).
+    /// Default true (opt-out). When off, `runTick` publishes to nobody but keeps receiving.
+    let globalSharingEnabledSubject = CurrentValueSubject<Bool, Never>(true)
 
     private init() {
         open()
@@ -79,6 +83,16 @@ final class Database {
         if !columnExists(table: "users", column: "outboundPairId") {
             exec("ALTER TABLE users ADD COLUMN outboundPairId TEXT;")
         }
+        if !columnExists(table: "users", column: "kind") {
+            // Person vs tracker row. TEXT name (`"PERSON"`/`"TRACKER"`), defaulting
+            // existing rows to PERSON. Additive migration only. Mirrors Android v9->10.
+            exec("ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'PERSON';")
+        }
+        if !columnExists(table: "users", column: "sharingAutoToggleWaypointId") {
+            // Arrival auto-toggle trigger (waypoint id). Null = none. Mutually exclusive
+            // with sharingAutoToggleAt. Additive migration only. Mirrors Android v8->9.
+            exec("ALTER TABLE users ADD COLUMN sharingAutoToggleWaypointId INTEGER;")
+        }
         exec("""
         CREATE TABLE IF NOT EXISTS waypoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -102,6 +116,19 @@ final class Database {
         """)
         exec("CREATE INDEX IF NOT EXISTS index_LocationValue_timestamp ON locationValues (timestamp);")
         exec("CREATE INDEX IF NOT EXISTS index_LocationValue_userid_timestamp ON locationValues (userid, timestamp);")
+        if !columnExists(table: "locationValues", column: "reportedAt") {
+            // When the report was SENT (epoch seconds). Backfills from `timestamp`: every
+            // pre-migration row was a live report, where the two are equal.
+            // Mirrors Android v11->12.
+            exec("ALTER TABLE locationValues ADD COLUMN reportedAt INTEGER NOT NULL DEFAULT 0;")
+            exec("UPDATE locationValues SET reportedAt = timestamp WHERE reportedAt = 0;")
+        }
+        if !columnExists(table: "locationValues", column: "source") {
+            // `LocationSource` name. Pre-migration rows were all live reports.
+            // Mirrors Android v11->12.
+            exec("ALTER TABLE locationValues ADD COLUMN source TEXT NOT NULL DEFAULT 'LIVE';")
+        }
+        exec("CREATE INDEX IF NOT EXISTS index_LocationValue_userid_reportedAt ON locationValues (userid, reportedAt);")
         exec("""
         CREATE TABLE IF NOT EXISTS temporaryLinks (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -120,6 +147,24 @@ final class Database {
         if !columnExists(table: "temporaryLinks", column: "pqcSeed") {
             exec("ALTER TABLE temporaryLinks ADD COLUMN pqcSeed TEXT;")
         }
+        exec("""
+        CREATE TABLE IF NOT EXISTS noShowAlerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            watchedUserId INTEGER NOT NULL,
+            waypointId INTEGER,
+            expectedAt INTEGER NOT NULL,
+            grace INTEGER NOT NULL,
+            fired INTEGER NOT NULL,
+            oneShot INTEGER NOT NULL
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS index_NoShowAlert_watchedUserId ON noShowAlerts (watchedUserId);")
+        exec("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        );
+        """)
     }
 
     // MARK: - Reload helpers
@@ -133,6 +178,8 @@ final class Database {
             let locs = self.loadLocationValues()
             self.locationValuesSubject.send(locs)
             self.latestLocationsSubject.send(Self.computeLatest(locs))
+            self.noShowAlertsSubject.send(self.loadNoShowAlerts())
+            self.globalSharingEnabledSubject.send(self.loadGlobalSharingEnabled())
         }
     }
 
@@ -165,8 +212,8 @@ final class Database {
     func upsertUser(_ u: User) {
         queue.sync {
             let sql = """
-            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId, kind, sharingAutoToggleWaypointId)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
@@ -184,6 +231,8 @@ final class Database {
             bindOptionalInt64(stmt, 12, u.sharingAutoToggleAt.map { Int64($0.timeIntervalSince1970) })
             bindOptionalText(stmt, 13, u.inboundPairId)
             bindOptionalText(stmt, 14, u.outboundPairId)
+            bindText(stmt, 15, u.kind.rawValue)
+            bindOptionalInt64(stmt, 16, u.sharingAutoToggleWaypointId)
             sqlite3_step(stmt)
             sqlite3_finalize(stmt)
             usersSubject.send(loadUsers())
@@ -297,10 +346,11 @@ final class Database {
         }
     }
 
-    /// Atomically set only the auto-toggle deadline (nil = "Never"). Avoids clobbering other columns.
+    /// Atomically set only the auto-toggle deadline (nil = "Never"). Also clears any arrival
+    /// trigger so the two auto-toggle modes stay mutually exclusive (mirrors Android).
     func setSharingAutoToggleAt(id: Int64, at: Date?) {
         queue.sync {
-            let sql = "UPDATE users SET sharingAutoToggleAt = ? WHERE id = ?;"
+            let sql = "UPDATE users SET sharingAutoToggleAt = ?, sharingAutoToggleWaypointId = NULL WHERE id = ?;"
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
             bindOptionalInt64(stmt, 1, at.map { Int64($0.timeIntervalSince1970) })
@@ -311,10 +361,51 @@ final class Database {
         }
     }
 
+    /// Atomically set the arrival auto-toggle waypoint (nil = none). Also clears any time-based
+    /// deadline so the two auto-toggle modes stay mutually exclusive (mirrors Android).
+    func setSharingAutoToggleWaypointId(id: Int64, waypointId: Int64?) {
+        queue.sync {
+            let sql = "UPDATE users SET sharingAutoToggleWaypointId = ?, sharingAutoToggleAt = NULL WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindOptionalInt64(stmt, 1, waypointId)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Atomically flip sharing for every row whose arrival trigger points at a waypoint "Me"
+    /// is currently inside. The waypoint id in the WHERE clause guards against TOCTOU races
+    /// the same way the timer does: a cleared or re-pointed trigger no longer matches. Clears
+    /// the trigger on flip so it fires once per arrival. Mirrors Android `applyDueArrivalToggles`.
+    /// Returns rows flipped.
+    @discardableResult
+    func applyDueArrivalToggles(insideWaypointIds: [Int64]) -> Int {
+        guard !insideWaypointIds.isEmpty else { return 0 }
+        return queue.sync {
+            let placeholders = insideWaypointIds.map { _ in "?" }.joined(separator: ",")
+            let sql = "UPDATE users SET sendingEnabled = CASE WHEN sendingEnabled THEN 0 ELSE 1 END, sharingAutoToggleWaypointId = NULL WHERE sharingAutoToggleWaypointId IS NOT NULL AND sharingAutoToggleWaypointId IN (\(placeholders));"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            for (i, wid) in insideWaypointIds.enumerated() {
+                sqlite3_bind_int64(stmt, Int32(i + 1), wid)
+            }
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            let changed = Int(sqlite3_changes(db))
+            if changed > 0 {
+                usersSubject.send(loadUsers())
+            }
+            return changed
+        }
+    }
+
     /// Atomically set sharing enabled AND clear any pending auto-toggle (manual toggle path).
     func setSendingEnabledAndClearToggle(id: Int64, enabled: Bool) {
         queue.sync {
-            let sql = "UPDATE users SET sendingEnabled = ?, sharingAutoToggleAt = NULL WHERE id = ?;"
+            let sql = "UPDATE users SET sendingEnabled = ?, sharingAutoToggleAt = NULL, sharingAutoToggleWaypointId = NULL WHERE id = ?;"
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
             sqlite3_bind_int(stmt, 1, enabled ? 1 : 0)
@@ -357,10 +448,9 @@ final class Database {
 
     private func loadUsers() -> [User] {
         var out: [User] = []
-        // pqcEncryptionKey/lastWaypointId/sharingAutoToggleAt/inboundPairId/outboundPairId
-        // columns added via idempotent migrations; SELECT explicitly to handle older dbs
-        // (see rc-fallback below).
-        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId FROM users;"
+        // kind/sharingAutoToggleWaypointId columns added via idempotent migrations;
+        // SELECT explicitly to handle older dbs (see rc-fallback below).
+        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId, kind, sharingAutoToggleWaypointId FROM users;"
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
@@ -380,8 +470,10 @@ final class Database {
                     encryptionKey: text(stmt, 7),
                     platform: text(stmt, 8),
                     pqcEncryptionKey: nil,
+                    kind: .person,
                     lastWaypointId: nil,
-                    sharingAutoToggleAt: nil
+                    sharingAutoToggleAt: nil,
+                    sharingAutoToggleWaypointId: nil
                 ))
             }
             sqlite3_finalize(stmt)
@@ -399,10 +491,12 @@ final class Database {
                 encryptionKey: text(stmt, 7),
                 platform: text(stmt, 8),
                 pqcEncryptionKey: text(stmt, 9),
+                inboundPairId: text(stmt, 12),
+                outboundPairId: text(stmt, 13),
+                kind: UserKind(rawValue: text(stmt, 14) ?? "PERSON") ?? .person,
                 lastWaypointId: optInt64(stmt, 10),
                 sharingAutoToggleAt: optInt64(stmt, 11).map { Date(timeIntervalSince1970: TimeInterval($0)) },
-                inboundPairId: text(stmt, 12),
-                outboundPairId: text(stmt, 13)
+                sharingAutoToggleWaypointId: optInt64(stmt, 15)
             ))
         }
         sqlite3_finalize(stmt)
@@ -474,7 +568,7 @@ final class Database {
 
     func insertLocationValue(_ l: LocationValue) {
         queue.sync {
-            let sql = "INSERT INTO locationValues (userid, lat, lon, speed, acc, timestamp, battery) VALUES (?, ?, ?, ?, ?, ?, ?);"
+            let sql = "INSERT INTO locationValues (userid, lat, lon, speed, acc, timestamp, battery, reportedAt, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
             sqlite3_bind_int64(stmt, 1, l.userid)
@@ -484,6 +578,8 @@ final class Database {
             sqlite3_bind_double(stmt, 5, Double(l.acc))
             sqlite3_bind_int64(stmt, 6, Int64(l.timestamp.timeIntervalSince1970))
             sqlite3_bind_double(stmt, 7, Double(l.battery))
+            sqlite3_bind_int64(stmt, 8, Int64(l.reportedAt.timeIntervalSince1970))
+            bindText(stmt, 9, l.source.rawValue)
             sqlite3_step(stmt)
             sqlite3_finalize(stmt)
             reloadLocations()
@@ -503,11 +599,14 @@ final class Database {
 
     private func loadLocationValues() -> [LocationValue] {
         var out: [LocationValue] = []
-        let sql = "SELECT id, userid, lat, lon, speed, acc, timestamp, battery FROM locationValues;"
+        // reportedAt/source persisted since the schema step; older rows backfilled at
+        // migration time, so the SELECT reads them directly — no reconstruction.
+        let sql = "SELECT id, userid, lat, lon, speed, acc, timestamp, battery, reportedAt, source FROM locationValues;"
         var stmt: OpaquePointer?
         sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         while sqlite3_step(stmt) == SQLITE_ROW {
             let measured = Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6)))
+            let sent: Date = optInt64(stmt, 8).map { Date(timeIntervalSince1970: TimeInterval($0)) } ?? measured
             out.append(LocationValue(
                 id: sqlite3_column_int64(stmt, 0),
                 userid: sqlite3_column_int64(stmt, 1),
@@ -516,14 +615,8 @@ final class Database {
                 acc: Float(sqlite3_column_double(stmt, 5)),
                 timestamp: measured,
                 battery: Float(sqlite3_column_double(stmt, 7)),
-                // Neither column is persisted, so both are reconstructed. That is sound only
-                // because unrecognised sources are dropped at decode and iOS accepts nothing
-                // but live reports today — so every stored row IS a live report of the tracked
-                // device's own position. If iOS ever starts accepting NETWORK_SIGHTING, these
-                // two columns MUST be added to the schema first, or a stranger's position will
-                // come back from the database indistinguishable from a real fix.
-                reportedAt: measured,
-                source: .live
+                reportedAt: sent,
+                source: LocationSource.decode(text(stmt, 9))
             ))
         }
         sqlite3_finalize(stmt)
@@ -615,6 +708,139 @@ final class Database {
         }
         sqlite3_finalize(stmt)
         return out
+    }
+
+    // MARK: - No-show alerts
+
+    /// Insert a new alert. The id is always allocated by SQLite AUTOINCREMENT, even when the
+    /// caller passes a nonzero id — the column is never written explicitly, so a re-imported
+    /// row can never collide with a live one.
+    @discardableResult
+    func createNoShowAlert(_ alert: NoShowAlert) -> NoShowAlert {
+        var result = alert
+        queue.sync {
+            let sql = "INSERT INTO noShowAlerts (watchedUserId, waypointId, expectedAt, grace, fired, oneShot) VALUES (?, ?, ?, ?, ?, ?);"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            sqlite3_bind_int64(stmt, 1, alert.watchedUserId)
+            bindOptionalInt64(stmt, 2, alert.waypointId)
+            sqlite3_bind_int64(stmt, 3, Int64(alert.expectedAt.timeIntervalSince1970))
+            sqlite3_bind_int64(stmt, 4, Int64((alert.grace * 1000).rounded()))
+            sqlite3_bind_int(stmt, 5, alert.fired ? 1 : 0)
+            sqlite3_bind_int(stmt, 6, alert.oneShot ? 1 : 0)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            result.id = sqlite3_last_insert_rowid(db)
+            noShowAlertsSubject.send(loadNoShowAlerts())
+        }
+        return result
+    }
+
+    func noShowAlert(id: Int64) -> NoShowAlert? {
+        noShowAlertsSubject.value.first { $0.id == id }
+    }
+
+    /// Alerts whose deadline (`expectedAt` + `grace`) has passed and which have not fired yet.
+    /// Due-ness is decided by `NoShowPolicy.isDue` — the same function the scheduler's
+    /// fire-guard uses — so the query and the policy can never drift apart (mirrors Android,
+    /// where `getDue` and `NoShowPolicy.isDue` agree by construction).
+    func dueNoShowAlerts(now: Date) -> [NoShowAlert] {
+        noShowAlertsSubject.value.filter {
+            !$0.fired && NoShowPolicy.isDue(expectedAt: $0.expectedAt, grace: $0.grace, now: now)
+        }
+    }
+
+    /// Mark fired only if the row has not fired yet, so two concurrent scheduler runs cannot
+    /// both claim it. Returns rows updated (0 or 1). Mirrors Android `markFired`.
+    @discardableResult
+    func markNoShowAlertFired(id: Int64) -> Int {
+        queue.sync {
+            let sql = "UPDATE noShowAlerts SET fired = 1 WHERE id = ? AND fired = 0;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            sqlite3_bind_int64(stmt, 1, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            let changed = Int(sqlite3_changes(db))
+            if changed > 0 {
+                noShowAlertsSubject.send(loadNoShowAlerts())
+            }
+            return changed
+        }
+    }
+
+    func rearmNoShowAlert(id: Int64) {
+        queue.sync {
+            let sql = "UPDATE noShowAlerts SET fired = 0 WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            sqlite3_bind_int64(stmt, 1, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            noShowAlertsSubject.send(loadNoShowAlerts())
+        }
+    }
+
+    func deleteNoShowAlert(_ alert: NoShowAlert) {
+        queue.sync {
+            exec("DELETE FROM noShowAlerts WHERE id = \(alert.id);")
+            noShowAlertsSubject.send(loadNoShowAlerts())
+        }
+    }
+
+    private func loadNoShowAlerts() -> [NoShowAlert] {
+        var out: [NoShowAlert] = []
+        let sql = "SELECT id, watchedUserId, waypointId, expectedAt, grace, fired, oneShot FROM noShowAlerts;"
+        var stmt: OpaquePointer?
+        sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(NoShowAlert(
+                id: sqlite3_column_int64(stmt, 0),
+                watchedUserId: sqlite3_column_int64(stmt, 1),
+                waypointId: optInt64(stmt, 2),
+                expectedAt: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 3))),
+                grace: TimeInterval(sqlite3_column_int64(stmt, 4)) / 1000.0,
+                fired: sqlite3_column_int(stmt, 5) != 0,
+                oneShot: sqlite3_column_int(stmt, 6) != 0
+            ))
+        }
+        sqlite3_finalize(stmt)
+        return out
+    }
+
+    // MARK: - Settings (persisted key/value)
+
+    /// Reads the persisted global-sharing switch (default true = opt-out, mirrors Android
+    /// `GLOBAL_SHARING_ENABLED_KEY`). Synchronous on the DB queue; callers should prefer the
+    /// `globalSharingEnabledSubject` snapshot on the tick path.
+    func isGlobalSharingEnabled() -> Bool {
+        queue.sync { loadGlobalSharingEnabled() }
+    }
+
+    func setGlobalSharingEnabled(_ enabled: Bool) {
+        queue.sync {
+            let sql = "INSERT OR REPLACE INTO settings (key, value) VALUES ('globalSharingEnabled', ?);"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, enabled ? "1" : "0")
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            globalSharingEnabledSubject.send(enabled)
+        }
+    }
+
+    /// Unsychronized read for use from inside `queue.sync` blocks (reloadAll) and the
+    /// `isGlobalSharingEnabled()` wrapper. Must only be called on the DB queue.
+    private func loadGlobalSharingEnabled() -> Bool {
+        let sql = "SELECT value FROM settings WHERE key = 'globalSharingEnabled';"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_finalize(stmt)
+            return true
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return true }
+        return (text(stmt, 0) ?? "1") != "0"
     }
 
     // MARK: - SQLite helpers

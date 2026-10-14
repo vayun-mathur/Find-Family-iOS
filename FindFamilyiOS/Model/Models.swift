@@ -44,6 +44,15 @@ enum RequestStatus: String, Codable, CaseIterable {
 
 // MARK: - User
 
+/// Distinguishes a normal person contact from a tracker row. Trackers reuse the
+/// `User` row (and therefore the whole map/list/relay pipeline) but are
+/// non-interactive. Stored as the enum name (`"PERSON"`/`"TRACKER"`), matching Android.
+/// Release rows are always `.person`.
+enum UserKind: String, Codable, Hashable {
+    case person = "PERSON"
+    case tracker = "TRACKER"
+}
+
 struct User: Identifiable, Codable, Hashable, Equatable {
     var id: Int64
     var name: String
@@ -70,19 +79,31 @@ struct User: Identifiable, Codable, Hashable, Equatable {
     /// full, never sent outside the encrypted payload.
     var inboundPairId: String? = nil
     var outboundPairId: String? = nil
+    /// Whether this row is a person contact or a tracker. Defaults to `.person`;
+    /// only tracker rows ever carry it as `.tracker`. Mirrors Android `User.kind`.
+    var kind: UserKind = .person
     /// Id of the waypoint this user is currently inside, used for enter/exit hysteresis.
     /// Nullable for migration and when the user is outside every waypoint.
     var lastWaypointId: Int64? = nil
     /// Deadline at which `sendingEnabled` auto-flips (the "Disable/Enable after" timer).
     /// `nil` means "Never" (no pending auto-toggle). Nullable for migration.
     var sharingAutoToggleAt: Date? = nil
+    /// Waypoint whose arrival (by "Me") flips `sendingEnabled`. Null means no arrival trigger.
+    /// Mutually exclusive with `sharingAutoToggleAt`: setting one clears the other.
+    /// Mirrors Android `User.sharingAutoToggleWaypointId`.
+    var sharingAutoToggleWaypointId: Int64? = nil
 
     static let empty = User(
         id: 0, name: "", photo: nil, locationName: "Unnamed Location",
         sendingEnabled: false, requestStatus: .mutualConnection,
         lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil, pqcEncryptionKey: nil,
-        lastWaypointId: nil, sharingAutoToggleAt: nil, inboundPairId: nil, outboundPairId: nil
+        inboundPairId: nil, outboundPairId: nil,
+        lastWaypointId: nil, sharingAutoToggleAt: nil
     )
+    // NOTE: no custom Decodable init on purpose. `kind` and `sharingAutoToggleWaypointId`
+    // both carry defaults, so the synthesized decoder already tolerates old backups that
+    // lack those keys — and, critically, adding any custom init would suppress the
+    // memberwise initializer every call site uses.
 }
 
 // MARK: - Waypoint
@@ -102,14 +123,18 @@ struct Waypoint: Identifiable, Codable, Hashable, Equatable {
 /// Why a location was reported. Mirrors `LocationSource` in Modern-Apps.
 ///
 /// The distinction that matters: `live`, `shutdown` and `batteryLow` all describe *the tracked
-/// device's own* position. A future `NETWORK_SIGHTING` would not — its coordinate belongs to
-/// whichever stranger's phone sighted the beacon. Mapping an unrecognised value onto `live`
-/// would therefore draw someone else's location on a family member's pin, so unrecognised
-/// values are dropped rather than guessed. See `LocationSource.decode`.
+/// device's own* position. `networkSighting` does not — its coordinate belongs to whichever
+/// stranger's phone sighted the beacon. Mapping such a value onto `live` would therefore draw
+/// someone else's location on a family member's pin, so sightings are persisted (the `source`
+/// column keeps them queryable) but never move the pin, rename the place, or raise alerts.
+/// Unrecognised values are dropped rather than guessed. See `LocationSource.decode`.
 enum LocationSource: String, Codable, Hashable {
     case live = "LIVE"
     case shutdown = "SHUTDOWN"
     case batteryLow = "BATTERY_LOW"
+    /// A crowd finder's proxy report: the coordinate is where the finder was standing, not
+    /// where the device is. Stored, never mapped. Mirrors Android `NETWORK_SIGHTING`.
+    case networkSighting = "NETWORK_SIGHTING"
 
     /// Decode-only. Never sent, never displayed — a value from a peer newer than this build,
     /// whose meaning we cannot know.
@@ -234,4 +259,28 @@ struct TemporaryLink: Identifiable, Codable, Hashable, Equatable {
     /// The 32-byte ML-KEM link seed (base64url, unpadded) — what goes in the fragment as `#s=`.
     /// This is the link's entire secret; the recipient's browser expands it into the keypair.
     var pqcSeed: String? = nil
+}
+
+// MARK: - NoShowAlert
+
+/// A watch for an expected arrival that never happened. Mirrors Android `data/NoShowAlert.kt`.
+///
+/// The scheduler (`NoShowScheduler.sweepDueNow`, run from every `runTick`) asks for rows whose
+/// deadline — `expectedAt` plus `grace` — has passed without the watched user appearing, then
+/// notifies and marks them fired. Time storage mirrors Android: `expectedAt` as epoch seconds,
+/// `grace` as whole milliseconds, booleans as 0/1 integers.
+struct NoShowAlert: Identifiable, Codable, Hashable, Equatable {
+    var id: Int64
+    /// Row id of the watched `User`.
+    var watchedUserId: Int64
+    /// Waypoint the user was expected at. Null means any fresh, accurate fix counts as arrival.
+    var waypointId: Int64?
+    /// When the user was expected.
+    var expectedAt: Date
+    /// Extra wait after `expectedAt` before the alert becomes due.
+    var grace: TimeInterval
+    /// Whether this alert has already fired. Set atomically via `markFired`.
+    var fired: Bool = false
+    /// When true the row is deleted after firing; when false it stays and can be re-armed.
+    var oneShot: Bool = true
 }
