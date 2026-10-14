@@ -96,6 +96,10 @@ enum Strings {
     static let notifWaypointExitTitle = "Place Update"
     static func notifWaypointExitBody(_ name: String, _ place: String) -> String { "\(name) left \(place)" }
 
+    // Per-person notification settings (iOS equivalent of Android's per-person channels).
+    static let notifSettingsAction = "Notification Settings"
+    static func notifSettingsForPerson(_ name: String) -> String { "Notification settings for \(name)" }
+
     static let okButton = "OK"
     static let cancelButton = "Cancel"
     static let doneButton = "Done"
@@ -189,13 +193,72 @@ enum TimeFormatting {
 // MARK: - Notifications
 
 enum NotificationsUtil {
-    static func send(title: String, body: String, category: String) {
+    /// Stable identifier so repeat events *replace* instead of stacking.
+    /// Mirrors Android's `"$userId::$category"` stable IDs.
+    /// Format: `ff-<userid>-<category>` (or `ff-<category>` when no user).
+    static func stableIdentifier(userId: Int64?, category: String) -> String {
+        if let userId {
+            return "ff-\(userId)-\(category)"
+        }
+        return "ff-\(category)"
+    }
+
+    /// Groups notifications per person/event in Notification Center.
+    /// Same scope as the stable identifier so one person's enter/exit
+    /// updates stay in one stack.
+    static func threadIdentifier(userId: Int64?, category: String) -> String {
+        stableIdentifier(userId: userId, category: category)
+    }
+
+    /// Closest iOS equivalent to Android's per-person channel settings.
+    /// iOS has no per-channel settings screen, so this opens the app's
+    /// notification settings page where the user can tune per-app
+    /// (and, on iOS 16+, per-delivery) behaviour. The UI agent wires this
+    /// behind per-person "Notification Settings" buttons.
+    static func notificationSettingsURL() -> URL? {
+        URL(string: UIApplication.openSettingsURLString)
+    }
+
+    /// Opens the app's notification settings page (main thread).
+    @MainActor
+    static func openNotificationSettings() {
+        guard let url = notificationSettingsURL() else { return }
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    }
+
+    /// Source-compatible with existing call sites: the three original
+    /// parameters are unchanged; the new ones are all defaulted so the
+    /// concurrent Location.swift edits keep compiling.
+    ///
+    /// - Parameters:
+    ///   - userId: Person this notification is about. When supplied, both
+    ///     the request identifier and threadIdentifier become
+    ///     `ff-<userid>-<category>` so repeats replace and group per person.
+    ///     When nil (legacy call sites), falls back to `ff-<category>`,
+    ///     which still replaces instead of stacking via `UUID()`.
+    ///   - identifier: Full override for the request identifier. Takes
+    ///     precedence over the derived stable identifier.
+    ///   - threadId: Full override for the threadIdentifier. Takes
+    ///     precedence over the derived per-person/event thread.
+    static func send(
+        title: String,
+        body: String,
+        category: String,
+        userId: Int64? = nil,
+        identifier: String? = nil,
+        threadId: String? = nil
+    ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.categoryIdentifier = category
+        content.threadIdentifier = threadId ?? threadIdentifier(userId: userId, category: category)
         content.sound = .default
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        let req = UNNotificationRequest(
+            identifier: identifier ?? stableIdentifier(userId: userId, category: category),
+            content: content,
+            trigger: nil
+        )
         UNUserNotificationCenter.current().add(req)
     }
 }
