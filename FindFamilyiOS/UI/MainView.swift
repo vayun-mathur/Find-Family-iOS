@@ -10,6 +10,7 @@ final class MainViewModel: ObservableObject {
     @Published var waypoints: [Waypoint] = []
     @Published var temporaryLinks: [TemporaryLink] = []
     @Published var latestLocations: [Int64: LocationValue] = [:]
+    @Published var globalSharingEnabled: Bool = true
 
     private var bag = Set<AnyCancellable>()
 
@@ -29,6 +30,10 @@ final class MainViewModel: ObservableObject {
         Database.shared.latestLocationsSubject
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.latestLocations = $0 }
+            .store(in: &bag)
+        Database.shared.globalSharingEnabledSubject
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.globalSharingEnabled = $0 }
             .store(in: &bag)
     }
 }
@@ -260,6 +265,8 @@ struct MainView: View {
                 UserDetailPanel(
                     user: user,
                     latest: vm.latestLocations[uid],
+                    waypoints: vm.waypoints,
+                    globalSharingEnabled: vm.globalSharingEnabled,
                     onChangeContact: { name, photo in
                         var u = user
                         u.name = name
@@ -287,6 +294,7 @@ struct MainView: View {
                         latestLocations: vm.latestLocations,
                         temporaryLinks: vm.temporaryLinks,
                         waypoints: vm.waypoints,
+                        globalSharingEnabled: vm.globalSharingEnabled,
                         onSelectUser: { id in
                             selectedUserId = id
                             isShowingPresent = true
@@ -303,6 +311,9 @@ struct MainView: View {
                             addPersonId = id
                             addPersonFingerprint = nil
                             showAddPersonDialog = true
+                        },
+                        onToggleGlobalSharing: { enabled in
+                            Database.shared.setGlobalSharingEnabled(enabled)
                         }
                     )
                 }

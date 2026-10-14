@@ -7,12 +7,15 @@ struct DefaultList: View {
     let latestLocations: [Int64: LocationValue]
     let temporaryLinks: [TemporaryLink]
     let waypoints: [Waypoint]
+    let globalSharingEnabled: Bool
     let onSelectUser: (Int64) -> Void
     let onSelectWaypoint: (Waypoint) -> Void
     let onTapRequest: (Int64) -> Void
+    let onToggleGlobalSharing: (Bool) -> Void
 
     var body: some View {
         VStack(spacing: 8) {
+            GlobalSharingToggle(isOn: globalSharingEnabled, onToggle: onToggleGlobalSharing)
             ForEach(users.filter { $0.requestStatus == .mutualConnection || $0.requestStatus == .awaitingResponse }) { u in
                 UserCard(user: u, latest: latestLocations[u.id], showSupporting: true) {
                     onSelectUser(u.id)
@@ -52,14 +55,50 @@ struct DefaultList: View {
     }
 }
 
+// MARK: - Global sharing toggle
+
+/// Top-level outbound-sharing master switch (mirrors Android `SharingTileService` +
+/// `LocationServiceController.GLOBAL_SHARING_ENABLED_KEY`). When off, the tick publishes
+/// to nobody but keeps receiving; per-person flags are untouched, so re-enabling resumes
+/// exactly the set of people the user was sharing with.
+struct GlobalSharingToggle: View {
+    let isOn: Bool
+    let onToggle: (Bool) -> Void
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text("Share location")
+                Spacer()
+                Toggle("", isOn: Binding(get: { isOn }, set: { onToggle($0) }))
+                    .labelsHidden()
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
+            if !isOn {
+                // Mirrors Android `sharing_paused_note`.
+                Text("Sharing is paused for everyone — turn sharing back on to resume")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 8)
+            }
+        }
+    }
+}
+
 // MARK: - User detail panel
 
 struct UserDetailPanel: View {
     let user: User
     let latest: LocationValue?
+    let waypoints: [Waypoint]
+    let globalSharingEnabled: Bool
     let onChangeContact: (String, String?) -> Void
     let onToggleSending: (Bool) -> Void
     let onSetAutoToggle: (TimeInterval?) -> Void
+
+    @State private var showNoShowDialog = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -73,8 +112,39 @@ struct UserDetailPanel: View {
                         Spacer()
                         Toggle("", isOn: Binding(get: { user.sendingEnabled }, set: { onToggleSending($0) }))
                             .labelsHidden()
+                            .disabled(!globalSharingEnabled)
+                    }
+                    if !globalSharingEnabled {
+                        // Mirrors Android `sharing_paused_note`: per-person switches keep
+                        // their state while paused, so resuming restores the same set.
+                        Text("Sharing is paused for everyone — turn sharing back on to resume")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     AutoToggleRow(user: user, onSet: onSetAutoToggle)
+                    // Per-person arrival/departure notification settings (mirrors Android
+                    // notification_settings_arrival/departure channel buttons). iOS has no
+                    // per-channel settings screen, so both open the app's notification
+                    // settings page (see NotificationsUtil.notificationSettingsURL).
+                    HStack(spacing: 8) {
+                        Button("Arrival alerts") {
+                            NotificationsUtil.openNotificationSettings()
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                        Button("Departure alerts") {
+                            NotificationsUtil.openNotificationSettings()
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                    }
+                    // No-show watch: expected arrival that never happens.
+                    Button("Watch for no-show") {
+                        showNoShowDialog = true
+                    }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
                 }
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
@@ -95,6 +165,9 @@ struct UserDetailPanel: View {
             .buttonStyle(.bordered)
         }
         .padding(.horizontal)
+        .sheet(isPresented: $showNoShowDialog) {
+            NoShowAlertDialog(user: user, waypoints: waypoints, isPresented: $showNoShowDialog)
+        }
     }
 }
 

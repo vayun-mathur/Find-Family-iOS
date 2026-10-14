@@ -334,3 +334,104 @@ struct AddLinkDialog: View {
         }
     }
 }
+
+// MARK: - NoShowAlertDialog
+
+/// Watches for an expected arrival that never happens (mirrors Android
+/// `ui/dialogs/NoShowAlertDialog.kt`): pick the expected place (Anywhere = nil
+/// waypointId, else one of the saved named waypoints), the expected date/time,
+/// and a grace period (0/15/30/60/120 minutes). Saving persists the row via
+/// `Database.createNoShowAlert`; the tick-side scheduler
+/// (`NoShowScheduler.sweepDueNow`, run from every `runTick`) fires it.
+struct NoShowAlertDialog: View {
+    let user: User
+    let waypoints: [Waypoint]
+    @Binding var isPresented: Bool
+
+    @State private var waypointId: Int64?
+    @State private var date = Date()
+    @State private var time = Date().addingTimeInterval(3600)
+    @State private var graceMinutes = 30
+
+    /// Grace options in minutes — mirrors Android's `listOf(0, 15, 30, 60, 120)`.
+    private static let graceOptions = [0, 15, 30, 60, 120]
+
+    private var namedWaypoints: [Waypoint] {
+        waypoints.filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    /// Merges the picked calendar day with the picked clock time in the device zone
+    /// (mirrors Android assembling dateMillis + hour/minute with the device zone).
+    private var expectedAt: Date? {
+        let cal = Calendar.current
+        let d = cal.dateComponents([.year, .month, .day], from: date)
+        let t = cal.dateComponents([.hour, .minute], from: time)
+        var merged = DateComponents()
+        merged.year = d.year
+        merged.month = d.month
+        merged.day = d.day
+        merged.hour = t.hour
+        merged.minute = t.minute
+        return cal.date(from: merged)
+    }
+
+    private func graceLabel(_ minutes: Int) -> String {
+        minutes == 0 ? "No wait" : "\(minutes) min"
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Expected place") {
+                    Picker("Place", selection: $waypointId) {
+                        Text("Anywhere").tag(nil as Int64?)
+                        ForEach(namedWaypoints) { wp in
+                            Text(wp.name).tag(wp.id as Int64?)
+                        }
+                    }
+                }
+                Section {
+                    DatePicker("Date", selection: $date, displayedComponents: .date)
+                    DatePicker("Time", selection: $time, displayedComponents: .hourAndMinute)
+                }
+                Section("Wait extra") {
+                    Picker("Grace period", selection: $graceMinutes) {
+                        ForEach(Self.graceOptions, id: \.self) { g in
+                            Text(graceLabel(g)).tag(g)
+                        }
+                    }
+                }
+                Section {
+                    Button("Watch") { save() }
+                        .disabled(expectedAt == nil)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .navigationTitle("Watch for \(user.name) not arriving")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isPresented = false }
+                }
+            }
+        }
+    }
+
+    private func save() {
+        guard let at = expectedAt else { return }
+        // Past-due input is still stored — the scheduler sweeps it immediately
+        // rather than rejecting it (mirrors Android `setNoShowAlert`).
+        // `id: 0` lets SQLite AUTOINCREMENT allocate the row id.
+        let alert = NoShowAlert(
+            id: 0,
+            watchedUserId: user.id,
+            waypointId: waypointId,
+            expectedAt: at,
+            grace: TimeInterval(graceMinutes * 60),
+            fired: false,
+            oneShot: true
+        )
+        _ = Database.shared.createNoShowAlert(alert)
+        isPresented = false
+    }
+}

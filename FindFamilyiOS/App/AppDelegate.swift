@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             await Networking.shared.start()
             // Begin location updates — this is the iOS analog of LocationTrackingService on Android.
             LocationsHandler.shared.startLocationUpdates()
+            // Publish latest-location snapshots into the shared App Group container
+            // for sibling extensions/apps (mirrors Android FamilyLocationService).
+            // No-op without the matching provisioning profile (see .entitlements).
+            FamilyLocationBridge.start()
         }
         return true
     }
