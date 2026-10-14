@@ -16,7 +16,9 @@ struct DefaultList: View {
     var body: some View {
         VStack(spacing: 8) {
             GlobalSharingToggle(isOn: globalSharingEnabled, onToggle: onToggleGlobalSharing)
-            ForEach(users.filter { $0.requestStatus == .mutualConnection || $0.requestStatus == .awaitingResponse }) { u in
+            // Trackers are disabled on iOS (see TrackerFeature): never list tracker
+            // rows even if one arrives via sync.
+            ForEach(users.filter { $0.kind == .person && ($0.requestStatus == .mutualConnection || $0.requestStatus == .awaitingResponse) }) { u in
                 UserCard(user: u, latest: latestLocations[u.id], showSupporting: true) {
                     onSelectUser(u.id)
                 }

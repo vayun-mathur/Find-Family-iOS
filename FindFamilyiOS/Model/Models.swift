@@ -53,6 +53,16 @@ enum UserKind: String, Codable, Hashable {
     case tracker = "TRACKER"
 }
 
+/// Tracker hardware support on iOS. The data layer understands tracker rows
+/// (`UserKind.tracker`, inbound-auth exclusion) so cross-platform relay packets
+/// never break parsing — but there is deliberately no tracker UI on iOS
+/// (no add/bind/scan flows) and this gate must stay `false`. Any future
+/// tracker surface must check `TrackerFeature.isEnabled` first, mirroring
+/// Android's `TrackerFeature` (`BuildConfig.DEV_BUILD`) gate.
+enum TrackerFeature {
+    static let isEnabled = false
+}
+
 struct User: Identifiable, Codable, Hashable, Equatable {
     var id: Int64
     var name: String

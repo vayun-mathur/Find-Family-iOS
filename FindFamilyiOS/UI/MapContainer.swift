@@ -27,8 +27,9 @@ struct MapContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ map: MKMapView, context: Context) {
-        // Sync annotations
+        // Sync annotations. Tracker rows never get pins (trackers disabled on iOS).
         let allUserAnnotations = users.compactMap { u -> UserAnnotation? in
+            guard u.kind == .person else { return nil }
             guard let loc = historicalPosition.flatMap({ selectedUserId == u.id ? $0 : latestLocations[u.id]?.coord }) ?? latestLocations[u.id]?.coord else { return nil }
             return UserAnnotation(user: u, coord: loc)
         }
