@@ -135,14 +135,19 @@ final class BackgroundTask {
         guard Networking.shared.isReady else { return }
         let battery = max(0, UIDevice.current.batteryLevel) * 100
         let coord = Coord(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
+        let now = Date()
         let me = LocationValue(
             id: Int64.random(in: Int64.min...Int64.max),
             userid: Networking.shared.userid,
             coord: coord,
             speed: Float(max(0, loc.speed)),
             acc: Float(max(0, loc.horizontalAccuracy)),
-            timestamp: Date(),
-            battery: battery
+            timestamp: now,
+            battery: battery,
+            // A live tick measures and reports at the same moment. iOS produces no other kind
+            // of report — shutdown and network-sighting sources are Android-only for now.
+            reportedAt: now,
+            source: .live
         )
 
         // Periodically (re)register so the server has our current key.
@@ -185,12 +190,46 @@ final class BackgroundTask {
             _ = await Networking.shared.publishLocation(me, toLink: link)
         }
 
-        // 5. Receive incoming peer locations. Any sender we don't already know about
-        // is added as AWAITING_REQUEST (Modern-Apps uses received locations — not a
-        // separate `/api/request_sharing` endpoint — to discover incoming requests).
+        // 5. Receive incoming peer locations. Authenticate before storing
+        // (GHSA-x94x-v6f7-wwpp): the ciphertext proves who a packet is FOR, not who it is
+        // FROM. Three gates — time-clamp, sender-auth, storage-eligibility — mirror
+        // Android `processIncomingFixes`: strangers become a pending request at most, and
+        // their coordinates are never stored, mapped, or enriched.
         if let incoming = await Networking.shared.receiveLocations() {
-            let knownIds = Set(users.map { $0.id } + [Networking.shared.userid])
-            let newSenderIds = Set(incoming.map { $0.userid }).subtracting(knownIds)
+            let now = Date()
+            let snapshot = Database.shared.usersSubject.value
+            let usersById = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
+            // Eligible senders: mutual/response contacts known when this batch arrived.
+            let eligibleIds = Set(snapshot.filter {
+                $0.requestStatus == .mutualConnection || $0.requestStatus == .awaitingResponse
+            }.map { $0.id })
+            var storable: [LocationValue] = []
+            storable.reserveCapacity(incoming.count)
+            var strangerIds = Set<Int64>()
+            for (loc, pairId) in incoming {
+                if loc.userid == Networking.shared.userid { continue }
+                if PairAuth.isFromTheFuture(reportedAt: loc.reportedAt, timestamp: loc.timestamp, now: now) {
+                    print("BackgroundTask: dropped future-dated fix from \(UInt64(bitPattern: loc.userid))")
+                    continue
+                }
+                guard let peer = usersById[loc.userid], eligibleIds.contains(loc.userid) else {
+                    // Stranger or not-yet-mutual: request row at most, never a pin, never storage.
+                    if usersById[loc.userid] == nil { strangerIds.insert(loc.userid) }
+                    else { print("BackgroundTask: dropped fix from ineligible sender \(UInt64(bitPattern: loc.userid))") }
+                    continue
+                }
+                switch PairAuth.checkInbound(expected: peer.inboundPairId, incoming: pairId) {
+                case .acceptMatch, .acceptLegacy:
+                    storable.append(loc)
+                case .acceptPin:
+                    Database.shared.pinInboundPairId(id: loc.userid, pairId: pairId!)
+                    storable.append(loc)
+                case .dropMismatch, .dropMissing:
+                    print("BackgroundTask: dropped unauthenticated fix claiming \(UInt64(bitPattern: loc.userid)) (pair \(PairAuth.logPreview(pairId)), expected \(PairAuth.logPreview(peer.inboundPairId)))")
+                }
+            }
+            let knownIds = Set(snapshot.map { $0.id } + [Networking.shared.userid])
+            let newSenderIds = strangerIds.subtracting(knownIds)
             for id in newSenderIds {
                 let user = User(
                     id: id, name: "ID \(Base26.encode(id))", photo: nil,
@@ -205,7 +244,7 @@ final class BackgroundTask {
                     category: "SHARING_REQUEST"
                 )
             }
-            for loc in incoming {
+            for loc in storable {
                 Database.shared.insertLocationValue(loc)
                 await updateUserLocationName(loc)
                 await maybeNotifyBatteryDrop(loc)
