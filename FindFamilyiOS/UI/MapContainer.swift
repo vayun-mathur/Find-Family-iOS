@@ -2,12 +2,6 @@ import SwiftUI
 import MapKit
 
 /// Wraps an `MKMapView` to show user pins, waypoint circles, and to expose camera + tap callbacks.
-///
-/// Camera policy (#782): the map never resets the region on its own. It only moves
-/// the camera for two explicit triggers, each consumed exactly once:
-/// - `fitAllToken` change → `showAnnotations` to fit every pin (initial load + explicit fit button).
-/// - `animateToCoord` value change → zoom to that coordinate (user/waypoint selection).
-/// Manual pan/zoom in between is never overridden.
 struct MapContainer: UIViewRepresentable {
     let users: [User]
     let latestLocations: [Int64: LocationValue]
@@ -19,8 +13,6 @@ struct MapContainer: UIViewRepresentable {
     let onMapTap: () -> Void
     let onCenterChanged: (Coord) -> Void
     let animateToCoord: Coord?
-    /// Increment to request a fit-all-pins. The coordinator consumes each value once.
-    let fitAllToken: Int
 
     func makeUIView(context: Context) -> MKMapView {
         let map = MKMapView()
@@ -61,48 +53,18 @@ struct MapContainer: UIViewRepresentable {
         }
 
         if let target = animateToCoord {
-            // Only move for a NEW target: after moving, record it so subsequent
-            // updateUIView passes (triggered by every location tick) don't snap
-            // the camera back over the user's manual zoom (#782).
-            if context.coordinator.lastAnimatedCoord != target {
-                context.coordinator.lastAnimatedCoord = target
-                let region = MKCoordinateRegion(
-                    center: target.clLocationCoordinate,
-                    latitudinalMeters: 2000, longitudinalMeters: 2000
-                )
-                map.setRegion(region, animated: true)
-            }
+            let region = MKCoordinateRegion(
+                center: target.clLocationCoordinate,
+                latitudinalMeters: 2000, longitudinalMeters: 2000
+            )
+            map.setRegion(region, animated: true)
         }
-
-        if context.coordinator.lastFitAllToken != fitAllToken {
-            context.coordinator.lastFitAllToken = fitAllToken
-            fitAllPins(on: map)
-        }
-    }
-
-    /// Fits every visible pin (users + waypoints + own location) with padding.
-    /// Called on first load and on explicit fit-button taps only — never on ticks.
-    private func fitAllPins(on map: MKMapView) {
-        var annotations: [any MKAnnotation] = map.annotations.filter { !($0 is MKUserLocation) }
-        if let own = map.userLocation.location, CLLocationCoordinate2DIsValid(own.coordinate) {
-            let pin = MKPointAnnotation()
-            pin.coordinate = own.coordinate
-            annotations.append(pin)
-        }
-        guard !annotations.isEmpty else { return }
-        map.showAnnotations(annotations, animated: true)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate {
         let parent: MapContainer
-        /// Last coordinate we animated to — guards against re-applying the same
-        /// target on every updateUIView (location ticks) and snapping back manual zoom.
-        var lastAnimatedCoord: Coord?
-        /// Last fit-all token consumed. Starts at -1 so the initial token (0)
-        /// performs the first-load fit-all (#782).
-        var lastFitAllToken: Int = -1
         init(parent: MapContainer) { self.parent = parent }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: any MKAnnotation) -> MKAnnotationView? {

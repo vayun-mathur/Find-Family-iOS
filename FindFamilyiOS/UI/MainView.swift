@@ -62,14 +62,6 @@ struct MainView: View {
         latitudinalMeters: 4000, longitudinalMeters: 4000
     )
     @State private var animateToCoord: Coord?
-    /// Incremented to ask MapContainer to fit all pins. Starts at 0 (unconsumed),
-    /// so the coordinator performs the initial fit-all on first appearance (#782),
-    /// and afterwards only on explicit fit-button taps.
-    @State private var fitAllToken = 0
-    /// One-time fit when the first locations arrive: data loads async after first
-    /// appearance, so the appearance-time fit may have been a no-op. Guarded to
-    /// fire exactly once — manual zoom afterwards is never overridden.
-    @State private var didInitialDataFit = false
 
     var body: some View {
         NavigationStack {
@@ -101,28 +93,8 @@ struct MainView: View {
                                 waypointCoord = coord
                             }
                         },
-                        animateToCoord: animateToCoord,
-                        fitAllToken: fitAllToken
+                        animateToCoord: animateToCoord
                     )
-                    // Explicit re-fit control, parked top-trailing (clear of the
-                    // bottom-trailing FAB/history bar): the only way to auto-fit
-                    // after the initial load. Manual pan/zoom is otherwise never
-                    // overridden. `overlay` content only hit-tests on the button
-                    // itself, so map gestures pass through everywhere else.
-                    .overlay(alignment: .topTrailing) {
-                        Button { fitAllToken += 1 } label: {
-                            Image(systemName: "map.fill")
-                                .font(.title3)
-                                .frame(width: 44, height: 44)
-                                .background(Color(.secondarySystemBackground))
-                                .foregroundStyle(.primary)
-                                .clipShape(Circle())
-                                .shadow(radius: 2)
-                        }
-                        .accessibilityLabel("Fit all devices on map")
-                        .padding(.trailing, 16)
-                        .padding(.top, 12)
-                    }
                     if selectedUserId != nil {
                         HistoryBar(
                             userid: selectedUserId!,
@@ -178,15 +150,6 @@ struct MainView: View {
             if let id = new, id != 0,
                let wp = vm.waypoints.first(where: { $0.id == id }) {
                 animateToCoord = wp.coord
-            }
-        }
-        .onChange(of: vm.latestLocations) { _, new in
-            // One-time fit-all when the first pins arrive (#782): the initial
-            // appearance-time fit may have run before async data loaded. Guarded
-            // to fire exactly once so later ticks never override manual zoom.
-            if !didInitialDataFit, !new.isEmpty {
-                didInitialDataFit = true
-                fitAllToken += 1
             }
         }
         // A tapped findfamily://add/<id> invite prefills the Add Person dialog. @Published
