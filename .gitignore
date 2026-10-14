@@ -1,1 +1,12 @@
+# SwiftPM build output (xtool and raw swift build both use .build/)
+.build/
+# xtool packaging output (staged .app bundles) and tmp builder packages
+xtool/
+# xtool editor integration (generated build-server config)
+.bsp/
+# Xcode user state
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+# macOS metadata
 .DS_Store

@@ -1,0 +1,21 @@
+# xtool app configuration for FindFamilyiOS.
+#
+# Schema: version is the xtool.yml schema version (always 1), NOT the app version.
+# Bundle identity mirrors FindFamilyiOS.xcodeproj (which stays the Xcode source of
+# truth — keep the two in sync):
+#  - PRODUCT_BUNDLE_IDENTIFIER = cc.findfamily.app.1
+#  - MARKETING_VERSION = 2.0, CURRENT_PROJECT_VERSION = 2 (from Info.plist / project)
+#  - IPHONEOS_DEPLOYMENT_TARGET = 18.0 (from Package.swift platforms)
+#
+# infoPath points at xtool-Info.plist, NOT FindFamilyiOS/Info.plist: xtool copies the
+# plist verbatim without expanding Xcode `$(...)` build variables
+# (CFBundleExecutable, CFBundleIdentifier, ...), so the Xcode plist would produce a
+# bundle that can never launch or install. xtool-Info.plist carries the same keys
+# with resolved values; sync it when permissions, URL schemes, or version change.
+
+version: 1
+bundleID: cc.findfamily.app.1
+# Library product in Package.swift to package into the .app bundle.
+product: FindFamilyiOS
+infoPath: xtool-Info.plist
+entitlementsPath: FindFamilyiOS/FindFamilyiOS.entitlements

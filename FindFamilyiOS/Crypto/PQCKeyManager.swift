@@ -16,7 +16,11 @@ import Foundation
 // This class is deliberately independent of Office — prefix `ff_pqc` ensures FindFamily PQC keys
 // don't collide with any future Office iOS implementation that might use `office` prefix.
 
-final class PQCKeyManager {
+/// Thread-safe via `loadQueue`: every read and write of the cached `_` state goes
+/// through the serial queue. Declared `@unchecked Sendable` (rather than plain
+/// `Sendable`) because the compiler cannot verify queue discipline — the discipline
+/// itself is what makes `shared` safe from any isolation (Swift 6 requirement).
+final class PQCKeyManager: @unchecked Sendable {
     static let shared = PQCKeyManager()
 
     // Keychain account names — use ff_pqc prefix matching Android's "ff_pqc" prefix.
@@ -45,13 +49,8 @@ final class PQCKeyManager {
     /// Returns the device PQC identity, generating + persisting on first use.
     /// Throws if Rust native lib is not linked (native not available on this build) or generation fails.
     func identity() throws -> PQCIdentity {
-        // Fast path in-memory.
-        if isLoaded, let pubB = _publicBundle, let privB = _privateBundle,
-           let kemPriv = _kemPriv, let kemPub = _kemPub {
-            return PQCIdentity(publicBundle: pubB, privateBundle: privB,
-                               kemPublic: kemPub, kemPrivate: kemPriv,
-                               dsaPublic: _dsaPub, dsaPrivate: _dsaPriv)
-        }
+        // All state access goes through the serial queue (no unlocked fast path — a
+        // lock-free read here would race the single write in the slow path below).
         return try loadQueue.sync {
             if isLoaded, let pubB = _publicBundle, let privB = _privateBundle,
                let kemPriv = _kemPriv, let kemPub = _kemPub {

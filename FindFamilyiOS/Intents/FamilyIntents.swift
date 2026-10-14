@@ -63,7 +63,7 @@ struct FamilyMember: AppEntity {
         TypeDisplayRepresentation(name: "Family member")
     }
 
-    static var defaultQuery = FamilyMemberQuery()
+    static let defaultQuery = FamilyMemberQuery()
 
     var id: String
     var name: String
@@ -123,11 +123,11 @@ enum ShareLinkError: Error, CustomLocalizedStringResourceConvertible {
 /// location for it until it expires), and return the same recipient URL the
 /// in-app copy button produces (`/view/<base26>#s=<seed>`).
 struct CreateShareLinkIntent: AppIntent {
-    static var title: LocalizedStringResource = "Create share link"
-    static var description = IntentDescription(
+    static let title: LocalizedStringResource = "Create share link"
+    static let description = IntentDescription(
         "Creates a FindFamily link that shares your location until it expires."
     )
-    static var openAppWhenRun: Bool = false
+    static let openAppWhenRun: Bool = false
 
     static var parameterSummary: some ParameterSummary {
         Summary("Create share link for \(\.$name)")
@@ -195,11 +195,11 @@ struct CreateShareLinkIntent: AppIntent {
 /// Siri/App Shortcuts entry point returning every family member's latest known
 /// location. Mirrors Android `intents/GetIntent.kt`.
 struct GetFamilyLocationsIntent: AppIntent {
-    static var title: LocalizedStringResource = "Get family locations"
-    static var description = IntentDescription(
+    static let title: LocalizedStringResource = "Get family locations"
+    static let description = IntentDescription(
         "Returns the latest known location of each family member."
     )
-    static var openAppWhenRun: Bool = false
+    static let openAppWhenRun: Bool = false
 
     func perform() async throws -> some IntentResult & ReturnsValue<[FamilyMember]> {
         let members = FamilyMember.all()

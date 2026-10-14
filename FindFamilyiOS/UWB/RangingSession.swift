@@ -46,8 +46,15 @@ final class RangingSession: NSObject, ObservableObject, NISessionDelegate {
 
     deinit {
         // Synchronous deinit; the session is already invalidated by SwiftUI's
-        // .onDisappear normally — this is a defensive cleanup.
-        session?.invalidate()
+        // .onDisappear normally — this is a defensive cleanup. `assumeIsolated`
+        // documents the existing assumption that the last reference always drops
+        // on main (all creation and use sites are main-actor bound); it traps in
+        // debug builds if that ever stops holding, rather than leaking a radio.
+        // (deinit is nonisolated, so plain access to main-actor `session` is a
+        // Swift 6 error.)
+        MainActor.assumeIsolated {
+            session?.invalidate()
+        }
     }
 
     func start(peer: User) {
@@ -374,10 +381,18 @@ final class RangingSession: NSObject, ObservableObject, NISessionDelegate {
     // MARK: - NISessionDelegate
 
     nonisolated func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
+        // Extract Sendable values before the actor hop: `NINearbyObject` itself is
+        // not Sendable, so capturing `nearbyObjects` into the `@MainActor` Task is
+        // a Swift 6 region-isolation error. Early-out semantics preserved exactly
+        // (nil first object leaves stale distance/direction untouched).
+        let first = nearbyObjects.first
+        let hasFirst = first != nil
+        let distance = first?.distance
+        let direction = first?.direction
         Task { @MainActor in
-            guard let obj = nearbyObjects.first else { return }
-            self.distance = obj.distance
-            self.direction = obj.direction
+            guard hasFirst else { return }
+            self.distance = distance
+            self.direction = direction
             self.maybeHaptic()
         }
     }

@@ -6,6 +6,11 @@ enum NetworkError: Error {
 }
 
 /// Thin URLSession wrapper for JSON POST endpoints.
+///
+/// Main-actor bound: `URLSession` itself is thread-safe, but `reset()` replaces the
+/// session object, so all access is serialized here (Swift 6 region-isolation
+/// requirement — `Networking` only ever touches it from the main actor anyway).
+@MainActor
 final class NetworkClient {
     let baseURL = URL(string: "https://findfamily.cc")!
     private var session: URLSession
@@ -81,7 +86,9 @@ final class Networking: ObservableObject {
     private static let livenessTimeout: TimeInterval = 75.0
 
     private var consecutiveFailures = 0
-    private var currentBackoff: TimeInterval = Self.backoffInitial
+    // Explicit `Networking.` (not `Self.`): covariant Self cannot be referenced from
+    // a stored-property initializer, even in a final class (Swift 6 enforces this).
+    private var currentBackoff: TimeInterval = Networking.backoffInitial
     /// Last completed HTTP round-trip (any status - a response proves liveness).
     /// Starts at launch so a server dead from boot still trips the wire at ~75s.
     private var lastSuccessAt = Date()

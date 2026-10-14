@@ -4,7 +4,12 @@ import SQLite3
 
 /// Lightweight SQLite wrapper providing CRUD + Combine publishers for each entity.
 /// All access is serialized through a single dispatch queue to keep things simple and safe.
-final class Database {
+///
+/// Declared `@unchecked Sendable` (rather than plain `Sendable`) because the compiler
+/// cannot verify queue discipline: all SQLite access (`db`) goes through `queue`, and
+/// the `CurrentValueSubject`s are internally lock-protected — which is what makes
+/// `shared` safe from any isolation (Swift 6 requirement).
+final class Database: @unchecked Sendable {
     static let shared = Database()
 
     private let queue = DispatchQueue(label: "cc.findfamily.db", qos: .userInitiated)

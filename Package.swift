@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.0
 // FindFamilyiOS SwiftPM manifest — lets xtool (https://github.com/xtool-org/xtool)
 // build the app on Linux/WSL/macOS without Xcode.
 //
@@ -22,6 +22,12 @@ let package = Package(
         // Mirrors IPHONEOS_DEPLOYMENT_TARGET = 18.0 in project.pbxproj.
         .iOS(.v18),
     ],
+    products: [
+        // xtool builds the .app bundle around a library product (not an executable
+        // target). The `@main` App struct in App/FindFamilyiOSApp.swift is still the
+        // entry point — xtool wraps it during `dev build`.
+        .library(name: "FindFamilyiOS", targets: ["FindFamilyiOS"]),
+    ],
     targets: [
         .target(
             name: "PQCStubs",
@@ -29,12 +35,14 @@ let package = Package(
             sources: ["PQCStubs.c"],
             publicHeadersPath: "PQCStubsHeader"
         ),
-        .executableTarget(
+        .target(
             name: "FindFamilyiOS",
             dependencies: ["PQCStubs"],
             path: "FindFamilyiOS",
             exclude: [
                 "Info.plist",
+                "FindFamilyiOS.entitlements",
+                "Assets.xcassets",
                 "Crypto/PQCStubs.c",
                 "Crypto/PQCStubsHeader",
                 "Preview Content",
@@ -43,6 +51,7 @@ let package = Package(
                 "App",
                 "Backup",
                 "Crypto",
+                "Intents",
                 "Location",
                 "Model",
                 "Networking",
@@ -52,7 +61,8 @@ let package = Package(
                 "UWB",
             ],
             resources: [
-                .process("Assets.xcassets"),
+                // NOTE: Assets.xcassets excluded until xtool's actool path works on
+                // Linux (see actool probe failure). App builds/runs iconless meanwhile.
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),

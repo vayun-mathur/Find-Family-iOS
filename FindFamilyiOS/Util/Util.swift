@@ -276,6 +276,10 @@ struct AddInvite: Equatable {
 /// link carries the sender's public id and a hash of their public key — never a key and
 /// never a secret — so prefilling the Add Person dialog from it is safe; the user still
 /// explicitly accepts, and the fingerprint is checked against the relay's key on connect.
+///
+/// Main-actor bound: this is UI state (`ObservableObject` + `@Published`, driven from
+/// `.onOpenURL`), so all access is serialized there (Swift 6 requirement).
+@MainActor
 final class DeepLinkRouter: ObservableObject {
     static let shared = DeepLinkRouter()
     private init() {}
@@ -332,7 +336,11 @@ enum Platform {
         vc.present(picker, animated: true)
     }
 
-    private static var handlerKey: UInt8 = 0
+    // Associated-object key: only its address is used (`&Self.handlerKey` above),
+    // never its value — nothing ever writes it. `nonisolated(unsafe)` documents
+    // that (a plain `let` cannot be passed as inout; a plain `var` trips Swift 6
+    // shared-state checking).
+    private nonisolated(unsafe) static var handlerKey: UInt8 = 0
 
     private static func topViewController() -> UIViewController? {
         let scene = UIApplication.shared.connectedScenes
@@ -356,9 +364,13 @@ private final class ContactPickerHandler: NSObject, CNContactPickerDelegate {
         if let data = contact.imageData {
             photoB64 = "data:image/jpeg;base64," + data.base64EncodedString()
         }
-        DispatchQueue.main.async {
-            self.onPicked(name.isEmpty ? "Unnamed" : name, photoB64)
-        }
+        let displayName = name.isEmpty ? "Unnamed" : name
+        // Direct call (no hop): UIKit guarantees contact-picker delegate callbacks on
+        // the main thread, and any hop (`DispatchQueue.main.async`,
+        // `MainActor.assumeIsolated`) takes a `@Sendable` closure that a non-Sendable
+        // delegate cannot enter under Swift 6 region isolation. Matches `Coordinator`
+        // below, which calls its own `onPicked` the same way.
+        self.onPicked(displayName, photoB64)
     }
     func contactPickerDidCancel(_ picker: CNContactPickerViewController) {}
 }
@@ -397,6 +409,10 @@ struct ContactPicker: UIViewControllerRepresentable {
 
 import CoreLocation
 
+/// UI state (`ObservableObject` + `@Published`, read by SwiftUI views), so main-actor
+/// bound — which is also what makes the `Task { @MainActor in self.refresh() }` hop in
+/// the delegate callback below legal under Swift 6 region isolation.
+@MainActor
 final class PermissionsController: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published var hasForeground = false
     @Published var hasBackground = false
@@ -424,7 +440,12 @@ final class PermissionsController: NSObject, ObservableObject, CLLocationManager
         manager.requestAlwaysAuthorization()
     }
 
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        Task { @MainActor in self.refresh() }
+    // Nonisolated: CoreLocation delegate requirements are not actor-isolated, and a
+    // @MainActor class cannot satisfy them with an isolated method. The body hops
+    // to main explicitly for the UI-state write.
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        // Nonisolated delegate callback (CoreLocation makes no isolation promise);
+        // hop to main for the UI-state write.
+        Task { @MainActor [weak self] in self?.refresh() }
     }
 }

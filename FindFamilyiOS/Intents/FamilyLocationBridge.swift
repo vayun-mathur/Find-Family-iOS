@@ -31,8 +31,10 @@ enum FamilyLocationBridge {
     /// File inside the shared container holding the latest snapshot JSON.
     static let fileName = "family_locations.json"
 
-    private static var bag = Set<AnyCancellable>()
-    private static var started = false
+    /// Subscription state. Main-actor bound: only `start()` (itself `@MainActor`)
+    /// touches these, so they are safe as global-actor-isolated state (Swift 6).
+    @MainActor private static var bag = Set<AnyCancellable>()
+    @MainActor private static var started = false
 
     /// Start publishing. Safe to call repeatedly; the second call is a no-op.
     /// Call sites: `AppDelegate` after networking starts (main actor).
