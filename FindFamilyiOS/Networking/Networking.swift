@@ -8,15 +8,26 @@ enum NetworkError: Error {
 /// Thin URLSession wrapper for JSON POST endpoints.
 final class NetworkClient {
     let baseURL = URL(string: "https://findfamily.cc")!
-    private let session: URLSession
-
+    private var session: URLSession
     init() {
+        self.session = Self.makeSession()
+    }
+
+    private static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 120
         cfg.waitsForConnectivity = true
         cfg.httpMaximumConnectionsPerHost = 4
-        self.session = URLSession(configuration: cfg)
+        return URLSession(configuration: cfg)
+    }
+
+    /// Drops the current session and builds a fresh one with the same config.
+    /// The liveness tripwire calls this - the HTTP equivalent of Android tearing
+    /// down and re-establishing the socket. Note: invalidates in-flight tasks.
+    func reset() {
+        session.invalidateAndCancel()
+        session = Self.makeSession()
     }
 
     func postJSON(path: String, jsonBody: Data) async throws -> (Data, HTTPURLResponse) {
@@ -57,6 +68,23 @@ final class Networking: ObservableObject {
     var pqcAvailable: Bool { pqcIdentity != nil }
 
     private var networkIsDown = false
+    // MARK: - Retry backoff + liveness tripwire
+
+    /// Mirrors Android's socket loop (`Networking.kt`): reconnects with 1s→15s
+    /// doubling backoff and treats no-inbound-for-75s as half-open death
+    /// (`NetworkingLive.kt` superviseConnection). iOS polls over stateless HTTP
+    /// every 3s (`BackgroundTask`), so the equivalents live here: every transport
+    /// error sleeps with doubling backoff (so a 3s tick loop can't hammer a dead
+    /// server), and no successful round-trip for ~75s resets the shared session.
+    private static let backoffInitial: TimeInterval = 1.0
+    private static let backoffMax: TimeInterval = 15.0
+    private static let livenessTimeout: TimeInterval = 75.0
+
+    private var consecutiveFailures = 0
+    private var currentBackoff: TimeInterval = Self.backoffInitial
+    /// Last completed HTTP round-trip (any status - a response proves liveness).
+    /// Starts at launch so a server dead from boot still trips the wire at ~75s.
+    private var lastSuccessAt = Date()
 
     /// Local platform tag included in outgoing heartbeat payloads so peers learn we're on iOS.
     static let platformTag = "ios"
@@ -222,7 +250,7 @@ final class Networking: ObservableObject {
         let body = Data(#"{"userid": \#(UInt64(bitPattern: id))}"#.utf8)
         do {
             let (data, http) = try await client.postJSON(path: "/api/pqc/getkey", jsonBody: body)
-            networkIsDown = false
+            noteSuccess()
             guard http.statusCode == 200 else { return nil }
             guard let b64 = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -232,7 +260,7 @@ final class Networking: ObservableObject {
                 else { return nil }
             return bundleData
         } catch {
-            checkNetworkDown(error)
+            await noteTransportFailure(error)
             return nil
         }
     }
@@ -260,7 +288,19 @@ final class Networking: ObservableObject {
             print("Networking: publishLocation no PQC bundle for \(UInt64(bitPattern: user.id)); peer must update")
             return false
         }
-        return await publishEncryptedPqc(location: location, recipientID: user.id, bundle: bundle) ?? false
+        // Hidden sender auth (GHSA-x94x-v6f7-wwpp): our outbound pair-ID secret for this
+        // peer, created once and never rotated (the peer pins the first value it sees).
+        let pairId = outboundPairId(for: user)
+        return await publishEncryptedPqc(location: location, recipientID: user.id, bundle: bundle, pairId: pairId) ?? false
+    }
+
+    /// Our outbound pair-ID secret for `user`. Uses the conditional write so two
+    /// concurrent ticks cannot mint different values - the loser re-reads the winner.
+    private func outboundPairId(for user: User) -> String {
+        if let existing = user.outboundPairId, !existing.isEmpty { return existing }
+        let fresh = PairAuth.generatePairId()
+        Database.shared.setOutboundPairIdIfAbsent(id: user.id, pairId: fresh)
+        return Database.shared.user(id: user.id)?.outboundPairId ?? fresh
     }
 
     private func resolvedPqcBundle(for user: User) async -> Data? {
@@ -279,13 +319,14 @@ final class Networking: ObservableObject {
         guard pqcAvailable, let b64 = link.pqcPublicKey, let bundle = Data(base64Encoded: b64), !bundle.isEmpty else {
             return false
         }
-        return await publishEncryptedPqc(location: location, recipientID: link.id, bundle: bundle) ?? false
+        // Anonymous link viewers prove nothing about identity and expect no auth.
+        return await publishEncryptedPqc(location: location, recipientID: link.id, bundle: bundle, pairId: nil) ?? false
     }
 
-    private func publishEncryptedPqc(location: LocationValue, recipientID: Int64, bundle: Data) async -> Bool? {
+    private func publishEncryptedPqc(location: LocationValue, recipientID: Int64, bundle: Data, pairId: String?) async -> Bool? {
         guard pqcAvailable else { return nil }
         do {
-            let json = try JSONEncoder().encode(location.toCompatible(senderPlatform: Self.platformTag))
+            let json = try JSONEncoder().encode(location.toCompatible(senderPlatform: Self.platformTag, pairId: pairId))
             // Encrypt via PQC (ML-KEM encaps + AES-GCM), same as Kotlin Pqc.encryptTo
             let sealed = try PQCKeyManager.shared.encryptTo(bundle: bundle, plaintext: json)
             let body = encodeJSON([
@@ -306,23 +347,25 @@ final class Networking: ObservableObject {
     /// Drains the post-quantum queue. The classic RSA queue is deliberately not read:
     /// this app publishes and receives post-quantum only, so anything sitting in the
     /// classic queue was sent by a peer that hasn't picked up our PQC key yet.
-    func receiveLocations() async -> [LocationValue]? {
+    func receiveLocations() async -> [(LocationValue, String?)]? {
         return await receiveLocationsPqc()
     }
 
-    private func receiveLocationsPqc() async -> [LocationValue]? {
+    private func receiveLocationsPqc() async -> [(LocationValue, String?)]? {
         guard pqcAvailable, (try? PQCKeyManager.shared.identity()) != nil else { return [] }
         let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
         do {
             let (data, http) = try await client.postJSON(path: "/api/location/receive_pqc", jsonBody: body)
-            networkIsDown = false
+            noteSuccess()
             if http.statusCode == 204 || data.isEmpty { return [] }
             guard http.statusCode == 200 else {
                 print("receiveLocationsPqc: HTTP \(http.statusCode)")
                 return nil
             }
             let arr = try JSONDecoder().decode([String].self, from: data)
-            var out: [LocationValue] = []
+            // Each element pairs the fix with its claimed pair ID (GHSA-x94x-v6f7-wwpp).
+            // Callers must authenticate before storing - see BackgroundTask.runTick.
+            var out: [(LocationValue, String?)] = []
             for b64 in arr {
                 guard let sealed = Data(base64Encoded: b64) else {
                     print("receiveLocationsPqc: skipped non-base64")
@@ -332,7 +375,16 @@ final class Networking: ObservableObject {
                     let plain = try PQCKeyManager.shared.decrypt(sealed: sealed)
                     let comp = try JSONDecoder().decode(LocationValueCompatible.self, from: plain)
                     let loc = comp.toLocationValue()
-                    out.append(loc)
+                    // Fail closed on a source this build does not know. `live`, `shutdown` and
+                    // `batteryLow` all mean "the tracked device's own position"; a newer peer's
+                    // category might not - a network sighting carries the FINDER's coordinate.
+                    // Rendering that as a family member's position would send someone to the
+                    // wrong place, so an uninterpretable report is dropped rather than guessed.
+                    guard loc.source != .unknown else {
+                        print("receiveLocationsPqc: dropped report with unknown source '\(comp.source ?? "")'")
+                        continue
+                    }
+                    out.append((loc, comp.pairId))
                     if let platform = comp.senderPlatform,
                        let u = Database.shared.user(id: loc.userid),
                        u.platform != platform {
@@ -345,30 +397,8 @@ final class Networking: ObservableObject {
             print("receiveLocationsPqc: \(out.count) location(s) for userid=\(UInt64(bitPattern: userid))")
             return out
         } catch {
-            checkNetworkDown(error)
+            await noteTransportFailure(error)
             return nil
-        }
-    }
-
-    func sendSharingRequest(to requestedID: Int64) async -> Bool {
-        let body = encodeJSON([
-            "requester": .uint64(UInt64(bitPattern: userid)),
-            "requested": .uint64(UInt64(bitPattern: requestedID)),
-        ])
-        return await postBool("/api/request_sharing/send", body: body)
-    }
-
-    func retrieveSharingRequests() async -> [Int64] {
-        let body = Data(#"{"requester": \#(UInt64(bitPattern: userid))}"#.utf8)
-        do {
-            let (data, http) = try await client.postJSON(path: "/api/request_sharing/retrieve", jsonBody: body)
-            networkIsDown = false
-            guard http.statusCode == 200 else { return [] }
-            let arr = (try? JSONDecoder().decode([String].self, from: data)) ?? []
-            return arr.compactMap { UInt64($0).map { Int64(bitPattern: $0) } }
-        } catch {
-            checkNetworkDown(error)
-            return []
         }
     }
 
@@ -426,7 +456,7 @@ final class Networking: ObservableObject {
         let body = Data(#"{"userid": \#(UInt64(bitPattern: userid))}"#.utf8)
         do {
             let (data, http) = try await client.postJSON(path: "/api/uwb/receive_pqc", jsonBody: body)
-            networkIsDown = false
+            noteSuccess()
             if http.statusCode == 204 || data.isEmpty { return [] }
             guard http.statusCode == 200 else { return nil }
             let arr = try JSONDecoder().decode([String].self, from: data)
@@ -440,7 +470,7 @@ final class Networking: ObservableObject {
             }
             return out
         } catch {
-            checkNetworkDown(error)
+            await noteTransportFailure(error)
             return nil
         }
     }
@@ -450,20 +480,54 @@ final class Networking: ObservableObject {
     private func postBool(_ path: String, body: Data) async -> Bool {
         do {
             let (_, http) = try await client.postJSON(path: path, jsonBody: body)
-            networkIsDown = false
+            noteSuccess()
             // Server returns 200 *or* 204 No Content on success for register/publish/problem.
             return (200..<300).contains(http.statusCode)
         } catch {
-            checkNetworkDown(error)
+            await noteTransportFailure(error)
             return false
         }
     }
 
-    private func checkNetworkDown(_ error: Error) {
+    /// A completed round-trip resets the failure streak: transport works, so any
+    /// wedged-poll suspicion is cleared. Called for any HTTP status - even a 500
+    /// proves the server is reachable. Failure semantics are unchanged: callers
+    /// still map non-2xx / empty / error to false / [] / nil as before.
+    private func noteSuccess() {
+        consecutiveFailures = 0
+        currentBackoff = Self.backoffInitial
+        lastSuccessAt = Date()
+        networkIsDown = false
+    }
+
+    /// A transport error (thrown by URLSession - timeout, DNS, refused, TLS): log
+    /// once while down, then sleep with 1s→15s doubling backoff so the 3s tick
+    /// loop doesn't hammer a dead server. Transport-error vs empty stays
+    /// distinct - callers still return nil/false (error) vs [] (empty) as before.
+    private func noteTransportFailure(_ error: Error) async {
         if !networkIsDown {
             print("network error: \(error.localizedDescription)")
         }
         networkIsDown = true
+        consecutiveFailures += 1
+        checkLivenessTripwire()
+        let nap = currentBackoff
+        currentBackoff = min(currentBackoff * 2, Self.backoffMax)
+        print("Networking: backing off \(nap)s after \(consecutiveFailures) consecutive failure(s)")
+        try? await Task.sleep(nanoseconds: UInt64(nap * 1_000_000_000))
+    }
+
+    /// Half-open detector (equivalent of Android's reconnect): if no successful
+    /// round-trip for ~75s the poll loop is wedged - reset the shared session
+    /// and log loudly. Re-arms for another window so a truly dead server trips
+    /// at most once per 75s; the backoff counter is left intact.
+    private func checkLivenessTripwire() {
+        let idle = Date().timeIntervalSince(lastSuccessAt)
+        guard idle >= Self.livenessTimeout else { return }
+        print("Networking: LIVENESS TRIPWIRE - no successful round-trip for \(Int(idle))s " +
+            "(\(consecutiveFailures) consecutive failures); resetting URLSession")
+        client.reset()
+        lastSuccessAt = Date()
     }
 }
 
