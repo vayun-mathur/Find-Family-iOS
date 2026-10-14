@@ -71,6 +71,14 @@ final class Database {
             // Auto-toggle deadline in epoch seconds (nullable = "Never"). Additive migration only.
             exec("ALTER TABLE users ADD COLUMN sharingAutoToggleAt INTEGER;")
         }
+        if !columnExists(table: "users", column: "inboundPairId") {
+            // Hidden sender-auth secrets (GHSA-x94x-v6f7-wwpp): per-peer pair IDs, nullable
+            // (= unpinned/legacy). Additive migration only; pinning happens at runtime.
+            exec("ALTER TABLE users ADD COLUMN inboundPairId TEXT;")
+        }
+        if !columnExists(table: "users", column: "outboundPairId") {
+            exec("ALTER TABLE users ADD COLUMN outboundPairId TEXT;")
+        }
         exec("""
         CREATE TABLE IF NOT EXISTS waypoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -138,7 +146,13 @@ final class Database {
         var out: [Int64: LocationValue] = [:]
         for l in locs {
             if let cur = out[l.userid] {
-                if l.timestamp > cur.timestamp { out[l.userid] = l }
+                // Rank on reportedAt (when we heard it), NOT timestamp (when the fix was
+                // measured). A shutdown report deliberately carries a stale fix, so ranking by
+                // measurement time makes it lose to the live heartbeat that preceded it — it
+                // would be stored and then never surfaced, which is the silent half-working
+                // failure this whole distinction exists to prevent. For every peer that
+                // predates the field reportedAt == timestamp, so this is a no-op for them.
+                if l.reportedAt > cur.reportedAt { out[l.userid] = l }
             } else {
                 out[l.userid] = l
             }
@@ -151,8 +165,8 @@ final class Database {
     func upsertUser(_ u: User) {
         queue.sync {
             let sql = """
-            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT OR REPLACE INTO users (id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             var stmt: OpaquePointer?
             sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
@@ -168,6 +182,8 @@ final class Database {
             bindOptionalText(stmt, 10, u.pqcEncryptionKey)
             bindOptionalInt64(stmt, 11, u.lastWaypointId)
             bindOptionalInt64(stmt, 12, u.sharingAutoToggleAt.map { Int64($0.timeIntervalSince1970) })
+            bindOptionalText(stmt, 13, u.inboundPairId)
+            bindOptionalText(stmt, 14, u.outboundPairId)
             sqlite3_step(stmt)
             sqlite3_finalize(stmt)
             usersSubject.send(loadUsers())
@@ -238,6 +254,49 @@ final class Database {
         }
     }
 
+    /// Pin the inbound pair ID expected from a peer (GHSA-x94x-v6f7-wwpp). Guarded by
+    /// `IS NULL` so a race or replayed first packet can never overwrite a pin.
+    func pinInboundPairId(id: Int64, pairId: String) {
+        queue.sync {
+            let sql = "UPDATE users SET inboundPairId = ? WHERE id = ? AND inboundPairId IS NULL;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, pairId)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Set our outbound pair ID for a peer (our own secret, our choice).
+    func setOutboundPairId(id: Int64, pairId: String) {
+        queue.sync {
+            let sql = "UPDATE users SET outboundPairId = ? WHERE id = ?;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, pairId)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
+    /// Fill our outbound pair ID only when absent (generate-on-first-send for legacy rows).
+    func setOutboundPairIdIfAbsent(id: Int64, pairId: String) {
+        queue.sync {
+            let sql = "UPDATE users SET outboundPairId = ? WHERE id = ? AND outboundPairId IS NULL;"
+            var stmt: OpaquePointer?
+            sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+            bindText(stmt, 1, pairId)
+            sqlite3_bind_int64(stmt, 2, id)
+            sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            usersSubject.send(loadUsers())
+        }
+    }
+
     /// Atomically set only the auto-toggle deadline (nil = "Never"). Avoids clobbering other columns.
     func setSharingAutoToggleAt(id: Int64, at: Date?) {
         queue.sync {
@@ -298,9 +357,10 @@ final class Database {
 
     private func loadUsers() -> [User] {
         var out: [User] = []
-        // pqcEncryptionKey/lastWaypointId/sharingAutoToggleAt columns added via idempotent
-        // migrations; SELECT explicitly to handle older dbs (see rc-fallback below).
-        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt FROM users;"
+        // pqcEncryptionKey/lastWaypointId/sharingAutoToggleAt/inboundPairId/outboundPairId
+        // columns added via idempotent migrations; SELECT explicitly to handle older dbs
+        // (see rc-fallback below).
+        let sql = "SELECT id, name, photo, locationName, sendingEnabled, requestStatus, lastLocationChangeTime, encryptionKey, platform, pqcEncryptionKey, lastWaypointId, sharingAutoToggleAt, inboundPairId, outboundPairId FROM users;"
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
@@ -340,7 +400,9 @@ final class Database {
                 platform: text(stmt, 8),
                 pqcEncryptionKey: text(stmt, 9),
                 lastWaypointId: optInt64(stmt, 10),
-                sharingAutoToggleAt: optInt64(stmt, 11).map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                sharingAutoToggleAt: optInt64(stmt, 11).map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                inboundPairId: text(stmt, 12),
+                outboundPairId: text(stmt, 13)
             ))
         }
         sqlite3_finalize(stmt)
@@ -445,14 +507,23 @@ final class Database {
         var stmt: OpaquePointer?
         sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         while sqlite3_step(stmt) == SQLITE_ROW {
+            let measured = Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6)))
             out.append(LocationValue(
                 id: sqlite3_column_int64(stmt, 0),
                 userid: sqlite3_column_int64(stmt, 1),
                 coord: Coord(lat: sqlite3_column_double(stmt, 2), lon: sqlite3_column_double(stmt, 3)),
                 speed: Float(sqlite3_column_double(stmt, 4)),
                 acc: Float(sqlite3_column_double(stmt, 5)),
-                timestamp: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 6))),
-                battery: Float(sqlite3_column_double(stmt, 7))
+                timestamp: measured,
+                battery: Float(sqlite3_column_double(stmt, 7)),
+                // Neither column is persisted, so both are reconstructed. That is sound only
+                // because unrecognised sources are dropped at decode and iOS accepts nothing
+                // but live reports today — so every stored row IS a live report of the tracked
+                // device's own position. If iOS ever starts accepting NETWORK_SIGHTING, these
+                // two columns MUST be added to the schema first, or a stranger's position will
+                // come back from the database indistinguishable from a real fix.
+                reportedAt: measured,
+                source: .live
             ))
         }
         sqlite3_finalize(stmt)

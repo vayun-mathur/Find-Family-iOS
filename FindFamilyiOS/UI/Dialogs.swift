@@ -166,6 +166,10 @@ struct AddPersonDialog: View {
             }
             let isAccepting = (status == .awaitingRequest)
             let newStatus: RequestStatus = isAccepting ? .mutualConnection : .awaitingResponse
+            // Hidden sender-auth secret (GHSA-x94x-v6f7-wwpp): our outbound pair ID for
+            // this peer. Minted once at explicit connect time, never rotated (the peer pins
+            // the first value it sees), never overwritten on re-add.
+            let existingOutbound = Database.shared.user(id: id)?.outboundPairId
             let user = User(
                 id: id,
                 name: name,
@@ -177,7 +181,8 @@ struct AddPersonDialog: View {
                 encryptionKey: nil,
                 // Store the fingerprint-checked key with the row itself, so the key that
                 // was verified is the one used from here on rather than a fresh lookup.
-                pqcEncryptionKey: check.verifiedBundleB64
+                pqcEncryptionKey: check.verifiedBundleB64,
+                outboundPairId: existingOutbound ?? PairAuth.generatePairId()
             )
             Database.shared.upsertUser(user)
             isPresented = false

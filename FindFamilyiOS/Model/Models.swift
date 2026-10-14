@@ -61,6 +61,15 @@ struct User: Identifiable, Codable, Hashable, Equatable {
     /// Post-quantum public bundle (base64 of [4B kemLen][kemPubDer][dsaPubDer]), nullable for migration.
     /// Same format as Android Office `Pqc.bundle` / `ff_pqc` key directory.
     var pqcEncryptionKey: String? = nil
+    /// Hidden per-peer sender-auth secrets (GHSA-x94x-v6f7-wwpp). Encryption to the peer's
+    /// bundle proves who a packet is *for*, not who it is *from*, and the userid inside is
+    /// self-declared. Each direction holds its own 128-bit secret (base64url unpadded):
+    /// `outboundPairId` is what this device puts in every packet to this peer (created once
+    /// at explicit connect time); `inboundPairId` is what it expects from them, pinned
+    /// trust-on-first-use. Null = unpinned/legacy. Never user-visible, never logged in
+    /// full, never sent outside the encrypted payload.
+    var inboundPairId: String? = nil
+    var outboundPairId: String? = nil
     /// Id of the waypoint this user is currently inside, used for enter/exit hysteresis.
     /// Nullable for migration and when the user is outside every waypoint.
     var lastWaypointId: Int64? = nil
@@ -72,7 +81,7 @@ struct User: Identifiable, Codable, Hashable, Equatable {
         id: 0, name: "", photo: nil, locationName: "Unnamed Location",
         sendingEnabled: false, requestStatus: .mutualConnection,
         lastLocationChangeTime: Date(), encryptionKey: nil, platform: nil, pqcEncryptionKey: nil,
-        lastWaypointId: nil, sharingAutoToggleAt: nil
+        lastWaypointId: nil, sharingAutoToggleAt: nil, inboundPairId: nil, outboundPairId: nil
     )
 }
 
@@ -90,6 +99,30 @@ struct Waypoint: Identifiable, Codable, Hashable, Equatable {
 
 // MARK: - LocationValue
 
+/// Why a location was reported. Mirrors `LocationSource` in Modern-Apps.
+///
+/// The distinction that matters: `live`, `shutdown` and `batteryLow` all describe *the tracked
+/// device's own* position. A future `NETWORK_SIGHTING` would not — its coordinate belongs to
+/// whichever stranger's phone sighted the beacon. Mapping an unrecognised value onto `live`
+/// would therefore draw someone else's location on a family member's pin, so unrecognised
+/// values are dropped rather than guessed. See `LocationSource.decode`.
+enum LocationSource: String, Codable, Hashable {
+    case live = "LIVE"
+    case shutdown = "SHUTDOWN"
+    case batteryLow = "BATTERY_LOW"
+
+    /// Decode-only. Never sent, never displayed — a value from a peer newer than this build,
+    /// whose meaning we cannot know.
+    case unknown = "__UNKNOWN__"
+
+    /// Absent on the wire means a peer predating the field, which only ever sent live reports.
+    /// Present but unrecognised means a peer newer than us.
+    static func decode(_ raw: String?) -> LocationSource {
+        guard let raw else { return .live }
+        return LocationSource(rawValue: raw) ?? .unknown
+    }
+}
+
 struct LocationValue: Identifiable, Codable, Hashable, Equatable {
     var id: Int64
     var userid: Int64
@@ -101,9 +134,20 @@ struct LocationValue: Identifiable, Codable, Hashable, Equatable {
     var timestamp: Date
     /// 0–100.
     var battery: Float
+    /// When the report was SENT, as opposed to when the fix was MEASURED (`timestamp`).
+    ///
+    /// These differ for a shutdown report, which deliberately carries a stale fix. Recency must
+    /// be judged on this, not on `timestamp` — ranking a shutdown report by its measurement time
+    /// makes it lose to the live heartbeat that preceded it, so it is stored and then never
+    /// shown. Peers predating the field fall back to `timestamp`.
+    ///
+    /// Deliberately has no default: every construction site should decide, because getting it
+    /// wrong is silent.
+    var reportedAt: Date
+    var source: LocationSource
 
     /// Convert to wire form. ULong on the wire, epoch-millis timestamp.
-    func toCompatible(sleep: Bool? = nil, senderPlatform: String? = nil) -> LocationValueCompatible {
+    func toCompatible(sleep: Bool? = nil, senderPlatform: String? = nil, pairId: String? = nil) -> LocationValueCompatible {
         LocationValueCompatible(
             id: UInt64(bitPattern: id),
             userid: UInt64(bitPattern: userid),
@@ -113,7 +157,8 @@ struct LocationValue: Identifiable, Codable, Hashable, Equatable {
             timestamp: Int64((timestamp.timeIntervalSince1970 * 1000).rounded()),
             battery: battery,
             sleep: sleep,
-            senderPlatform: senderPlatform
+            senderPlatform: senderPlatform,
+            pairId: pairId
         )
     }
 }
@@ -136,16 +181,37 @@ struct LocationValueCompatible: Codable {
     var sleep: Bool?
     /// Sender's platform tag (`"android"` or `"ios"`). Optional for backward compatibility.
     var senderPlatform: String?
+    /// Hidden sender-auth secret (GHSA-x94x-v6f7-wwpp): the sender's outbound pair ID for
+    /// the recipient. Base64url unpadded, ~22 chars. Nil = peer predates sender auth.
+    /// Same JSON key `pairId` as Android. Unknown keys are ignored on decode, so old
+    /// builds interoperate.
+    var pairId: String? = nil
+    /// `LocationValue.reportedAt` in epoch milliseconds. Absent from peers predating it, in
+    /// which case it falls back to `timestamp` — an older peer only ever sent live reports.
+    ///
+    /// iOS does not currently SEND this: it only ever produces live reports, and absent already
+    /// means live. Left nil rather than populated to keep the outbound payload byte-identical
+    /// to what older Android peers already parse.
+    var reportedAt: Int64? = nil
+    /// `LocationSource` by name. A plain string rather than the enum so a value this build has
+    /// never heard of degrades to `.unknown` instead of failing the whole decode — Android and
+    /// older iOS peers have to keep interoperating. Absent entirely means the peer predates the
+    /// field, which is `.live`. Not sent by iOS, for the same reason as `reportedAt`.
+    var source: String? = nil
 
     func toLocationValue() -> LocationValue {
-        LocationValue(
+        let measured = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0)
+        return LocationValue(
             id: Int64(bitPattern: id ?? 0),
             userid: Int64(bitPattern: userid),
             coord: coord,
             speed: speed,
             acc: acc,
-            timestamp: Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000.0),
-            battery: battery
+            timestamp: measured,
+            battery: battery,
+            reportedAt: reportedAt.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+                ?? measured,
+            source: LocationSource.decode(source)
         )
     }
 }
